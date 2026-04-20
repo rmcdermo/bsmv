@@ -1,0 +1,46 @@
+#pragma once
+
+#include <filesystem>
+#include <map>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace bsmv {
+
+struct SmokeFileEntry {
+  int mesh_index_1based = 0;
+  double value = 0.0;
+  std::string filename;
+  std::string quantity;
+  std::string short_name;
+  std::string units;
+};
+
+struct MeshGrid {
+  int mesh_index_1based = 0;
+  int ibar = 0;
+  int jbar = 0;
+  int kbar = 0;
+  std::vector<double> x;
+  std::vector<double> y;
+  std::vector<double> z;
+};
+
+struct SmvData {
+  std::string chid;
+  std::map<int, MeshGrid> grids;
+  std::vector<SmokeFileEntry> smoke_entries;
+};
+
+std::string trim(const std::string &s);
+std::string upper_copy(const std::string &s);
+std::string canonical_quantity(const std::string &name);
+
+SmvData parse_smv_file(const std::filesystem::path &path);
+
+std::unordered_map<int, SmokeFileEntry> find_smokf3d_entries(
+    const SmvData &smv,
+    const std::string &wanted_quantity);
+
+}  // namespace bsmv
