@@ -60,8 +60,9 @@ std::string canonical_quantity(const std::string &name) {
   const std::string q = upper_copy(trim(name));
   if (q == "EFFECTIVE FLAME TEMPERATURE") return "TEMPERATURE";
   if (q == "TEMPERATURE") return "TEMPERATURE";
-  if (q == "SOOT DENSITY") return "SOOT DENSITY";
   if (q == "HRRPUV") return "HRRPUV";
+  if (q == "DENSITY") return "DENSITY";
+  if (q.size() > 8 && q.substr(q.size() - 8) == " DENSITY") return "DENSITY";
   return q;
 }
 
@@ -79,6 +80,32 @@ SmvData parse_smv_file(const std::filesystem::path &path) {
     if (key == "CHID") {
       i = next_nonempty(lines, i + 1);
       if (i < static_cast<int>(lines.size())) smv.chid = trim(lines[i]);
+      ++i;
+      continue;
+    }
+
+    if (key == "HRRPUV_MINMAX") {
+      i = next_nonempty(lines, i + 1);
+      if (i < static_cast<int>(lines.size())) {
+        const auto toks = split_ws(lines[i]);
+        if (toks.size() >= 2) {
+          smv.hrrpuv_min = std::stod(toks[0]);
+          smv.hrrpuv_max = std::stod(toks[1]);
+        }
+      }
+      ++i;
+      continue;
+    }
+
+    if (key == "TEMP_MINMAX") {
+      i = next_nonempty(lines, i + 1);
+      if (i < static_cast<int>(lines.size())) {
+        const auto toks = split_ws(lines[i]);
+        if (toks.size() >= 2) {
+          smv.temp_min = std::stod(toks[0]);
+          smv.temp_max = std::stod(toks[1]);
+        }
+      }
       ++i;
       continue;
     }

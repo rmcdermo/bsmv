@@ -80,7 +80,11 @@ void write_manifest(
     const std::vector<double> &x,
     const std::vector<double> &y,
     const std::vector<double> &z,
-    const std::vector<ManifestFrameInfo> &frames) {
+    const std::vector<ManifestFrameInfo> &frames,
+    double ambient_c,
+    double temp_min_smv,
+    double temp_max_smv,
+    double smoke_mass_extinction) {
   const auto spacing_x = x.size() > 1 ? (x[1] - x[0]) : 1.0;
   const auto spacing_y = y.size() > 1 ? (y[1] - y[0]) : 1.0;
   const auto spacing_z = z.size() > 1 ? (z[1] - z[0]) : 1.0;
@@ -98,8 +102,11 @@ void write_manifest(
   out << "  \"temperature_grid_name\": \"temperature\",\n";
   out << "  \"density_grid_name\": \"density\",\n";
   out << "  \"temperature_units\": \"degC_above_ambient\",\n";
-  out << "  \"density_units\": \"kg_per_m3_proxy_from_s3d_decode\",\n";
-  out << "  \"ambient_c\": 20.0,\n";
+  out << "  \"density_units\": \"kg_per_m3\",\n";
+  out << "  \"ambient_c\": " << ambient_c << ",\n";
+  out << "  \"temperature_decode_min_c\": " << temp_min_smv << ",\n";
+  out << "  \"temperature_decode_max_c\": " << temp_max_smv << ",\n";
+  out << "  \"smoke_mass_extinction\": " << smoke_mass_extinction << ",\n";
   out << "  \"node_centered\": true,\n";
   out << "  \"spacing\": [" << spacing_x << ", " << spacing_y << ", " << spacing_z << "],\n";
   out << "  \"origin\": [" << x.front() << ", " << y.front() << ", " << z.front() << "],\n";

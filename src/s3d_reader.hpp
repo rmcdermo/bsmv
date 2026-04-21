@@ -25,6 +25,13 @@ struct S3dFrame {
   std::vector<std::uint8_t> values;  // size = nx*ny*nz, Fortran order
 };
 
+struct S3dSizeFrame {
+  double time = 0.0;
+  int32_t nchars_in = 0;
+  int32_t nchars_out = 0;
+  float max_val = 0.0f;
+};
+
 class S3dReader {
  public:
   explicit S3dReader(const std::filesystem::path &path);
@@ -45,9 +52,14 @@ class S3dReader {
   static void read_exact(std::ifstream &in, char *dst, std::size_t n);
 };
 
+std::vector<S3dSizeFrame> read_s3d_size_file(const std::filesystem::path &path);
 double median_spacing(const std::vector<double> &coords);
-std::vector<float> decode_temperature_c(const std::vector<std::uint8_t> &raw);
-std::vector<float> decode_temperature_excess_c(const std::vector<std::uint8_t> &raw, float ambient_c);
-std::vector<float> decode_soot_density(const std::vector<std::uint8_t> &raw, double dx, double dy, double dz);
+std::vector<float> decode_temperature_c(const std::vector<std::uint8_t> &raw, float tmin_c, float tmax_c);
+std::vector<float> decode_temperature_excess_c(
+    const std::vector<std::uint8_t> &raw,
+    float tmin_c,
+    float tmax_c,
+    float ambient_c);
+std::vector<float> decode_density_linear(const std::vector<std::uint8_t> &raw, float max_val);
 
 }  // namespace bsmv

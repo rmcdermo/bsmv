@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <limits>
+#include <sstream>
 #include <stdexcept>
 
 namespace bsmv {
@@ -116,7 +119,7 @@ bool S3dReader::next_frame(S3dFrame &frame) {
         throw std::runtime_error("Malformed RLE payload in " + path_.string());
       }
       value = compressed[in_pos + 1];
-      repeats = compressed[in_pos + 2];
+      repeats = static_cast<std::size_t>(compressed[in_pos + 2]);
       in_pos += 3;
     } else {
       value = compressed[in_pos];
@@ -139,6 +142,27 @@ bool S3dReader::next_frame(S3dFrame &frame) {
   return true;
 }
 
+std::vector<S3dSizeFrame> read_s3d_size_file(const std::filesystem::path &path) {
+  std::ifstream in(path);
+  if (!in) {
+    throw std::runtime_error("Could not open S3D size file: " + path.string());
+  }
+
+  std::vector<S3dSizeFrame> frames;
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.empty()) continue;
+
+    std::istringstream iss(line);
+    S3dSizeFrame fr;
+    if (!(iss >> fr.time >> fr.nchars_in >> fr.nchars_out >> fr.max_val)) {
+      continue;
+    }
+    frames.push_back(fr);
+  }
+  return frames;
+}
+
 double median_spacing(const std::vector<double> &coords) {
   if (coords.size() < 2) return 1.0;
   std::vector<double> diffs;
@@ -154,37 +178,33 @@ double median_spacing(const std::vector<double> &coords) {
   return diffs[mid];
 }
 
-std::vector<float> decode_temperature_c(const std::vector<std::uint8_t> &raw) {
+std::vector<float> decode_temperature_c(const std::vector<std::uint8_t> &raw, float tmin_c, float tmax_c) {
   std::vector<float> out(raw.size(), 0.0f);
-  constexpr float max_smv = 2000.0f;
-  constexpr float ambient_c = 20.0f;
+  const float denom = 254.0f;
+  const float span = tmax_c - tmin_c;
   for (std::size_t i = 0; i < raw.size(); ++i) {
-    out[i] = (static_cast<float>(raw[i]) / 254.0f) * (max_smv - ambient_c) + ambient_c;
+    out[i] = (static_cast<float>(raw[i]) / denom) * span + tmin_c;
   }
   return out;
 }
 
-std::vector<float> decode_temperature_excess_c(const std::vector<std::uint8_t> &raw, float ambient_c) {
-  auto t = decode_temperature_c(raw);
+std::vector<float> decode_temperature_excess_c(
+    const std::vector<std::uint8_t> &raw,
+    float tmin_c,
+    float tmax_c,
+    float ambient_c) {
+  auto t = decode_temperature_c(raw, tmin_c, tmax_c);
   for (auto &v : t) {
     v = std::max(v - ambient_c, 0.0f);
   }
   return t;
 }
 
-std::vector<float> decode_soot_density(const std::vector<std::uint8_t> &raw, double dx, double dy, double dz) {
+std::vector<float> decode_density_linear(const std::vector<std::uint8_t> &raw, float max_val) {
   std::vector<float> out(raw.size(), 0.0f);
-  const double dd = std::cbrt(dx * dy * dz);
-  const double factor = -8700.0 * dd;
+  const float factor = max_val / 254.0f;
   for (std::size_t i = 0; i < raw.size(); ++i) {
-    const double f = static_cast<double>(raw[i]);
-    const double arg = -((f / 254.0) - 1.0);
-    if (arg <= 0.0 || !std::isfinite(arg)) {
-      out[i] = 0.0f;
-      continue;
-    }
-    const double val = std::log(arg) / factor;
-    out[i] = std::isfinite(val) && val > 0.0 ? static_cast<float>(val) : 0.0f;
+    out[i] = static_cast<float>(raw[i]) * factor;
   }
   return out;
 }

@@ -3,6 +3,7 @@
 #include "vdb_writer.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -97,6 +98,10 @@ std::string zero4(int n) {
   return oss.str();
 }
 
+bool nearly_equal(double a, double b, double atol = 1.0e-4) {
+  return std::abs(a - b) <= atol;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -125,6 +130,10 @@ int main(int argc, char **argv) {
     fs::create_directories(args.out_dir);
     status(args, "Writing VDB sequences to: " + fs::absolute(args.out_dir).string());
 
+    constexpr float ambient_c = 20.0f;
+    const float temp_min_smv = static_cast<float>(smv.temp_min);
+    const float temp_max_smv = static_cast<float>(smv.temp_max);
+
     int mesh_counter = 0;
     for (const int mesh_id : meshes) {
       ++mesh_counter;
@@ -138,18 +147,17 @@ int main(int argc, char **argv) {
 
       const fs::path temp_path = args.result_dir / fs::path(temp_ent.filename).filename();
       const fs::path dens_path = args.result_dir / fs::path(dens_ent.filename).filename();
+      const fs::path dens_sz_path = dens_path.string() + ".sz";
 
       status(args, "Starting mesh " + std::to_string(mesh_id) + " (" +
                        std::to_string(mesh_counter) + "/" + std::to_string(meshes.size()) + ")");
       status(args, "  temperature: " + temp_path.string());
       status(args, "  density    : " + dens_path.string());
+      status(args, "  density sz : " + dens_sz_path.string());
 
       bsmv::S3dReader temp_reader(temp_path);
       bsmv::S3dReader dens_reader(dens_path);
-
-      const double dx = bsmv::median_spacing(grid.x);
-      const double dy = bsmv::median_spacing(grid.y);
-      const double dz = bsmv::median_spacing(grid.z);
+      const auto dens_sizes = bsmv::read_s3d_size_file(dens_sz_path);
 
       std::vector<bsmv::ManifestFrameInfo> manifest_frames;
 
@@ -163,13 +171,27 @@ int main(int argc, char **argv) {
         }
         if (!ok_t) break;
 
+        if (iframe >= static_cast<int>(dens_sizes.size())) {
+          throw std::runtime_error("Density .sz file has fewer frames than .s3d for mesh " + std::to_string(mesh_id));
+        }
+        const auto &dens_sz = dens_sizes[static_cast<std::size_t>(iframe)];
+        if (dens_sz.nchars_in != dens_frame.nchars_in || dens_sz.nchars_out != dens_frame.nchars_out) {
+          throw std::runtime_error("Density .sz nchars mismatch at frame " + std::to_string(iframe) +
+                                   " for mesh " + std::to_string(mesh_id));
+        }
+        if (!nearly_equal(dens_sz.time, static_cast<double>(dens_frame.time))) {
+          status(args, "WARNING: density .sz time mismatch at frame " + std::to_string(iframe) +
+                           " for mesh " + std::to_string(mesh_id));
+        }
+
         const bool take = (!args.start || iframe >= *args.start) &&
                           (!args.stop || iframe < *args.stop) &&
                           ((iframe - (args.start ? *args.start : 0)) % args.stride == 0);
 
         if (take) {
-          auto temperature = bsmv::decode_temperature_excess_c(temp_frame.values, 20.0f);
-          auto density = bsmv::decode_soot_density(dens_frame.values, dx, dy, dz);
+          auto temperature = bsmv::decode_temperature_excess_c(
+              temp_frame.values, temp_min_smv, temp_max_smv, ambient_c);
+          auto density = bsmv::decode_density_linear(dens_frame.values, dens_sz.max_val);
 
           const std::string out_name =
               args.chid + "_mesh_" + zero4(mesh_id) + "_frame_" + zero4(iframe) + ".vdb";
@@ -201,8 +223,23 @@ int main(int argc, char **argv) {
         ++iframe;
       }
 
+      if (static_cast<std::size_t>(iframe) != dens_sizes.size()) {
+        status(args, "WARNING: density .sz frame count differs from .s3d for mesh " + std::to_string(mesh_id));
+      }
+
       const fs::path manifest_path = args.out_dir / (args.chid + "_mesh_" + zero4(mesh_id) + "_manifest.json");
-      bsmv::write_manifest(manifest_path, args.chid, mesh_id, grid.x, grid.y, grid.z, manifest_frames);
+      bsmv::write_manifest(
+          manifest_path,
+          args.chid,
+          mesh_id,
+          grid.x,
+          grid.y,
+          grid.z,
+          manifest_frames,
+          ambient_c,
+          temp_min_smv,
+          temp_max_smv,
+          dens_ent.value);
 
       status(args, "Finished mesh " + std::to_string(mesh_id) +
                        " with " + std::to_string(manifest_frames.size()) + " written frames");

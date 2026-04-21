@@ -29,6 +29,10 @@ struct MeshGrid {
 
 struct SmvData {
   std::string chid;
+  double hrrpuv_min = 0.0;
+  double hrrpuv_max = 1200.0;
+  double temp_min = 20.0;
+  double temp_max = 2000.0;
   std::map<int, MeshGrid> grids;
   std::vector<SmokeFileEntry> smoke_entries;
 };

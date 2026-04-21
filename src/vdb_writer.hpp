@@ -30,7 +30,11 @@ void write_manifest(
     const std::vector<double> &x,
     const std::vector<double> &y,
     const std::vector<double> &z,
-    const std::vector<ManifestFrameInfo> &frames);
+    const std::vector<ManifestFrameInfo> &frames,
+    double ambient_c,
+    double temp_min_smv,
+    double temp_max_smv,
+    double smoke_mass_extinction);
 
 std::tuple<double, double> minmax(const std::vector<float> &arr);
 
