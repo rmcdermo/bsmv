@@ -9,36 +9,46 @@ from pathlib import Path
 # -----------------------------------------------------------------------------
 BLENDER_AUTORUN = True
 BLENDER_CHID = "simple_test"
-BLENDER_MESH_IDS = None          # None => auto-discover manifests for this chid
-BLENDER_VDB_DIR = None           # Use a full path if relative resolution is annoying
+BLENDER_MESH_IDS = None
+BLENDER_VDB_DIR = "/Users/rmcdermo/GitHub/firemodels/fds/Verification/Fires/vdb_sequence_simple"
 
 # Loading / ordering
 BLENDER_SORT_MODE = "mesh"       # "mesh", "rank", or "signal"
-BLENDER_START_INDEX = 0          # index into discovered/sorted manifest list
-BLENDER_MAX_MESHES = None        # None => no cap
-BLENDER_MANIFEST_STRIDE = 1      # 1 => every manifest, 2 => every other, etc.
-BLENDER_SKIP_EXISTING = True     # if a VDB object already exists, leave it alone
+BLENDER_START_INDEX = 0
+BLENDER_MAX_MESHES = None
+BLENDER_MANIFEST_STRIDE = 1
+BLENDER_SKIP_EXISTING = False
 BLENDER_SKIP_BAD_MANIFESTS = True
 BLENDER_SKIP_MISSING_VDB = True
 BLENDER_PRINT_EVERY = 10
 
-# Optional signal filtering (useful for partial / ranked directories)
+# Optional signal filtering
 SIGNAL_REQUIRE_DATA = False
-SIGNAL_TEMP_MIN = 400.0          # degC above ambient
-SIGNAL_DENSITY_MIN = 1.0e-10     # tiny soot threshold just to reject all-zero meshes
+SIGNAL_TEMP_MIN = 400.0
+SIGNAL_DENSITY_MIN = 1.0e-10
 SIGNAL_TEMP_WEIGHT = 1.0
 SIGNAL_DENSITY_WEIGHT = 0.25
 
-# Flame controls (temperature grid is stored as degC above ambient)
+# Flame controls
 FLAME_TEMP_MIN = 400.0
 FLAME_TEMP_MAX = 1200.0
 EMISSION_STRENGTH = 12.0
 
-# Smoke controls (density grid comes from decoded SOOT DENSITY)
+# Smoke controls
 USE_SMOKE = True
-SMOKE_DENSITY_SCALE = 8700.0
 SMOKE_COLOR = (0.035, 0.035, 0.035, 1.0)
 SMOKE_ANISOTROPY = 0.0
+
+# Automatic physical smoke scaling:
+#   Density input ~= K_m * d_eff
+# where
+#   K_m   = smoke_mass_extinction from the manifest
+#   d_eff = cbrt(dx*dy*dz) from manifest spacing
+USE_AUTO_SMOKE_SCALE = True
+SMOKE_SCALE_MULTIPLIER = 1.0
+
+# Manual fallback if auto metadata is missing or auto mode is disabled
+SMOKE_DENSITY_SCALE = 1.0
 
 # Scene settings
 SET_CYCLES = False
@@ -229,7 +239,31 @@ def slice_manifest_paths(paths):
     return sliced
 
 
-def ensure_material(name: str = "FDS_FlameSmoke_Volume"):
+def effective_spacing(spacing):
+    dx = abs(float(spacing[0]))
+    dy = abs(float(spacing[1]))
+    dz = abs(float(spacing[2]))
+    return (dx * dy * dz) ** (1.0 / 3.0)
+
+
+def compute_smoke_density_input(manifest: dict) -> float:
+    if not USE_SMOKE:
+        return 0.0
+
+    if not USE_AUTO_SMOKE_SCALE:
+        return float(SMOKE_DENSITY_SCALE)
+
+    spacing = manifest.get("spacing", [1.0, 1.0, 1.0])
+    km = float(manifest.get("smoke_mass_extinction", 0.0))
+    deff = effective_spacing(spacing)
+
+    auto_scale = km * deff * float(SMOKE_SCALE_MULTIPLIER)
+    if auto_scale <= 0.0:
+        return float(SMOKE_DENSITY_SCALE)
+    return auto_scale
+
+
+def build_base_material(name: str = "FDS_FlameSmoke_Volume_Base"):
     mat = bpy.data.materials.get(name)
     if mat is None:
         mat = bpy.data.materials.new(name=name)
@@ -245,6 +279,7 @@ def ensure_material(name: str = "FDS_FlameSmoke_Volume"):
 
     vol = nodes.new(type="ShaderNodeVolumePrincipled")
     vol.location = (520, 0)
+    vol.name = "FDS_VolumePrincipled"
 
     try:
         vol.density_attribute = "density"
@@ -309,6 +344,26 @@ def ensure_material(name: str = "FDS_FlameSmoke_Volume"):
     return mat
 
 
+def material_for_manifest(base_mat, manifest: dict, obj_name: str):
+    mat_name = f"FDS_FlameSmoke_{obj_name}"
+    old = bpy.data.materials.get(mat_name)
+    if old is not None:
+        bpy.data.materials.remove(old, do_unlink=True)
+
+    mat = base_mat.copy()
+    mat.name = mat_name
+
+    density_input = compute_smoke_density_input(manifest)
+    vol = mat.node_tree.nodes.get("FDS_VolumePrincipled")
+    if vol is not None:
+        vol.inputs["Color"].default_value = SMOKE_COLOR
+        vol.inputs["Anisotropy"].default_value = SMOKE_ANISOTROPY
+        vol.inputs["Density"].default_value = density_input
+
+    manifest["_loader_smoke_density_input"] = density_input
+    return mat
+
+
 def remove_existing_volume(name: str):
     obj = bpy.data.objects.get(name)
     if obj is not None:
@@ -333,7 +388,7 @@ def usable_frames(vdb_dir: Path, manifest: dict):
     return good
 
 
-def import_volume_sequence(vdb_dir: Path, manifest_path: Path, mat, coll, parent):
+def import_volume_sequence(vdb_dir: Path, manifest_path: Path, base_mat, coll, parent):
     manifest = load_manifest(manifest_path)
     obj_name = object_name_from_manifest(manifest)
 
@@ -385,6 +440,7 @@ def import_volume_sequence(vdb_dir: Path, manifest_path: Path, mat, coll, parent
         except Exception:
             pass
 
+    mat = material_for_manifest(base_mat, manifest, obj_name)
     if len(vol.materials) == 0:
         vol.materials.append(mat)
     else:
@@ -447,7 +503,7 @@ def run(chid: str = BLENDER_CHID, mesh_ids=BLENDER_MESH_IDS):
                 f"rhoMax={info.get('density_max', 0.0):.6g}"
             )
 
-    mat = ensure_material()
+    base_mat = build_base_material()
     coll = ensure_collection(VDB_COLLECTION_NAME)
     parent = ensure_empty(f"{CASE_PARENT_NAME}_{chid}", coll)
 
@@ -458,7 +514,7 @@ def run(chid: str = BLENDER_CHID, mesh_ids=BLENDER_MESH_IDS):
 
     for i, manifest_path in enumerate(manifest_paths, start=1):
         try:
-            obj, manifest, mode = import_volume_sequence(vdb_dir, manifest_path, mat, coll, parent)
+            obj, manifest, mode = import_volume_sequence(vdb_dir, manifest_path, base_mat, coll, parent)
         except Exception as exc:
             if BLENDER_SKIP_BAD_MANIFESTS:
                 skipped_count += 1
@@ -470,6 +526,10 @@ def run(chid: str = BLENDER_CHID, mesh_ids=BLENDER_MESH_IDS):
             imported_count += 1
             objs.append(obj)
             manifests.append(manifest)
+            status(
+                f"Loaded {obj.name}: smoke_density_input="
+                f"{manifest.get('_loader_smoke_density_input', 0.0):.6g}"
+            )
         elif mode == "existing":
             objs.append(obj)
             manifests.append(manifest)
@@ -492,7 +552,7 @@ def run(chid: str = BLENDER_CHID, mesh_ids=BLENDER_MESH_IDS):
 
     status(f"Imported/kept {len(objs)} VDB sequences from {vdb_dir}")
     status(f"Skipped {skipped_count} manifests")
-    status("Material: FDS_FlameSmoke_Volume")
+    status("Material: per-object FDS_FlameSmoke_*")
     return objs
 
 
