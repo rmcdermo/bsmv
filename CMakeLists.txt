@@ -40,7 +40,7 @@ if(OpenVDB_FOUND)
   message(STATUS "Found OpenVDB via CMake package config")
   target_link_libraries(bsmv PRIVATE OpenVDB::openvdb)
 
-  # Some OpenVDB package configs propagate TBB, some do not.
+  # Some OpenVDB configs propagate TBB, some do not.
   if(TBB_FOUND)
     message(STATUS "Found TBB via CMake package config")
     if(TARGET TBB::tbb)
@@ -60,14 +60,14 @@ if(NOT _bsmv_openvdb_found)
 
     if(OPENVDB_PC_FOUND)
       message(STATUS "Found OpenVDB via pkg-config")
-      target_include_directories(bsmv PRIVATE ${OPENVDB_PC_INCLUDE_DIRS})
+      target_include_directories(bsmv SYSTEM PRIVATE ${OPENVDB_PC_INCLUDE_DIRS})
       target_link_directories(bsmv PRIVATE ${OPENVDB_PC_LIBRARY_DIRS})
       target_link_libraries(bsmv PRIVATE ${OPENVDB_PC_LIBRARIES})
       target_compile_options(bsmv PRIVATE ${OPENVDB_PC_CFLAGS_OTHER})
 
       if(TBB_PC_FOUND)
         message(STATUS "Found TBB via pkg-config")
-        target_include_directories(bsmv PRIVATE ${TBB_PC_INCLUDE_DIRS})
+        target_include_directories(bsmv SYSTEM PRIVATE ${TBB_PC_INCLUDE_DIRS})
         target_link_directories(bsmv PRIVATE ${TBB_PC_LIBRARY_DIRS})
         target_link_libraries(bsmv PRIVATE ${TBB_PC_LIBRARIES})
         target_compile_options(bsmv PRIVATE ${TBB_PC_CFLAGS_OTHER})
@@ -176,7 +176,7 @@ if(NOT _bsmv_openvdb_found)
     get_filename_component(_openvdb_libdir "${OPENVDB_LIBRARY}" DIRECTORY)
     get_filename_component(_openvdb_prefix_from_lib "${_openvdb_libdir}" DIRECTORY)
 
-    target_include_directories(bsmv PRIVATE
+    target_include_directories(bsmv SYSTEM PRIVATE
       "${OPENVDB_INCLUDE_DIR}"
       "${_openvdb_prefix_from_include}"
       "${_openvdb_prefix_from_lib}/include"
@@ -184,7 +184,8 @@ if(NOT _bsmv_openvdb_found)
     target_link_libraries(bsmv PRIVATE "${OPENVDB_LIBRARY}")
 
     if(TBB_INCLUDE_DIR)
-      target_include_directories(bsmv PRIVATE "${TBB_INCLUDE_DIR}")
+      message(STATUS "Found TBB include path via manual search")
+      target_include_directories(bsmv SYSTEM PRIVATE "${TBB_INCLUDE_DIR}")
     endif()
 
     if(TBB_LIBRARY)
@@ -215,6 +216,11 @@ if(BSMV_STRICT_WARNINGS)
   if(MSVC)
     target_compile_options(bsmv PRIVATE /W4)
   else()
-    target_compile_options(bsmv PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(bsmv PRIVATE
+      -Wall
+      -Wextra
+      -Wpedantic
+      -Wno-c++23-attribute-extensions
+    )
   endif()
 endif()
