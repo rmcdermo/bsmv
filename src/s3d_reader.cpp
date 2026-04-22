@@ -7,6 +7,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 namespace bsmv {
 
@@ -118,6 +119,7 @@ bool S3dReader::next_frame(S3dFrame &frame) {
       if (in_pos + 2 >= compressed.size()) {
         throw std::runtime_error("Malformed RLE payload in " + path_.string());
       }
+      // Current files decode correctly as: 255, value, repeats
       value = compressed[in_pos + 1];
       repeats = static_cast<std::size_t>(compressed[in_pos + 2]);
       in_pos += 3;
@@ -154,10 +156,32 @@ std::vector<S3dSizeFrame> read_s3d_size_file(const std::filesystem::path &path) 
     if (line.empty()) continue;
 
     std::istringstream iss(line);
-    S3dSizeFrame fr;
-    if (!(iss >> fr.time >> fr.nchars_in >> fr.nchars_out >> fr.max_val)) {
-      continue;
+    std::vector<double> vals;
+    double x = 0.0;
+    while (iss >> x) {
+      vals.push_back(x);
     }
+
+    // Skip header/count lines like just "0"
+    if (vals.size() < 4) continue;
+
+    S3dSizeFrame fr;
+    fr.time = vals[0];
+    fr.nchars_in = static_cast<std::int32_t>(std::lround(vals[1]));
+
+    if (vals.size() >= 6) {
+      // Newer density .sz format:
+      //   TIME NCHARS_IN old_nchars_out old_max new_nchars_out new_max
+      // Use the LAST pair, which matches the current .s3d payload.
+      fr.nchars_out = static_cast<std::int32_t>(std::lround(vals[4]));
+      fr.max_val = static_cast<float>(vals[5]);
+    } else {
+      // Classic format:
+      //   TIME NCHARS_IN NCHARS_OUT MAX_VAL
+      fr.nchars_out = static_cast<std::int32_t>(std::lround(vals[2]));
+      fr.max_val = static_cast<float>(vals[3]);
+    }
+
     frames.push_back(fr);
   }
   return frames;
