@@ -2,21 +2,34 @@
 #include "smv_parser.hpp"
 #include "vdb_writer.hpp"
 
+#include <openvdb/openvdb.h>
+
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <csignal>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
 
 namespace {
+
+volatile std::sig_atomic_t g_stop_requested = 0;
+
+void handle_sigint(int) {
+  g_stop_requested = 1;
+}
 
 struct Args {
   std::string chid;
@@ -30,12 +43,9 @@ struct Args {
   int stride = 1;
   std::set<int> mesh_ids;
   int progress_every = 10;
+  int threads = 1;
   bool quiet = false;
 };
-
-void status(const Args &args, const std::string &msg) {
-  if (!args.quiet) std::cout << msg << std::endl;
-}
 
 std::set<int> parse_mesh_ids(const std::string &text) {
   std::set<int> out;
@@ -68,6 +78,7 @@ Args parse_args(int argc, char **argv) {
     else if (a == "--stride") args.stride = std::max(1, std::stoi(need(a)));
     else if (a == "--mesh-ids") args.mesh_ids = parse_mesh_ids(need(a));
     else if (a == "--progress-every") args.progress_every = std::max(1, std::stoi(need(a)));
+    else if (a == "--threads") args.threads = std::max(1, std::stoi(need(a)));
     else if (a == "--quiet") args.quiet = true;
     else if (a == "--help" || a == "-h") {
       std::cout <<
@@ -81,6 +92,7 @@ Args parse_args(int argc, char **argv) {
         "  --stride N\n"
         "  --mesh-ids 1,2,7\n"
         "  --progress-every N\n"
+        "  --threads N\n"
         "  --quiet\n";
       std::exit(0);
     } else {
@@ -102,13 +114,206 @@ bool nearly_equal(double a, double b, double atol = 1.0e-4) {
   return std::abs(a - b) <= atol;
 }
 
+struct SharedState {
+  std::mutex log_mutex;
+  std::atomic<std::size_t> next_mesh_index{0};
+  std::atomic<int> meshes_completed{0};
+  std::atomic<int> meshes_started{0};
+  std::atomic<int> meshes_failed{0};
+};
+
+void status(const Args &args, SharedState &shared, const std::string &msg) {
+  if (args.quiet) return;
+  std::lock_guard<std::mutex> lock(shared.log_mutex);
+  std::cout << msg << std::endl;
+}
+
+std::string mesh_prefix(const std::string &tag, int mesh_id) {
+  std::ostringstream oss;
+  oss << "[" << tag << " mesh " << mesh_id << "] ";
+  return oss.str();
+}
+
+bool select_density_max(
+    const bsmv::S3dSizeFrame &sz,
+    const bsmv::S3dFrame &dens_frame,
+    float &chosen_max,
+    std::string &why)
+{
+  if (sz.has_primary &&
+      sz.nchars_in == dens_frame.nchars_in &&
+      sz.nchars_out == dens_frame.nchars_out) {
+    chosen_max = sz.max_val;
+    why = "primary";
+    return true;
+  }
+
+  if (sz.has_secondary &&
+      sz.nchars_in == dens_frame.nchars_in &&
+      sz.nchars_out2 == dens_frame.nchars_out) {
+    chosen_max = sz.max_val2;
+    why = "secondary";
+    return true;
+  }
+
+  return false;
+}
+
+bool process_mesh(
+    const Args &args,
+    SharedState &shared,
+    const bsmv::SmvData &smv,
+    const std::unordered_map<int, bsmv::SmokeFileEntry> &temp_by_mesh,
+    const std::unordered_map<int, bsmv::SmokeFileEntry> &dens_by_mesh,
+    int mesh_id)
+{
+  const auto grid_it = smv.grids.find(mesh_id);
+  if (grid_it == smv.grids.end()) {
+    throw std::runtime_error("Missing grid metadata for mesh " + std::to_string(mesh_id));
+  }
+  const auto &grid = grid_it->second;
+  const auto &temp_ent = temp_by_mesh.at(mesh_id);
+  const auto &dens_ent = dens_by_mesh.at(mesh_id);
+
+  const fs::path temp_path = args.result_dir / fs::path(temp_ent.filename).filename();
+  const fs::path dens_path = args.result_dir / fs::path(dens_ent.filename).filename();
+  const fs::path dens_sz_path = dens_path.string() + ".sz";
+
+  status(args, shared, mesh_prefix("start", mesh_id) + "temperature: " + temp_path.string());
+  status(args, shared, mesh_prefix("start", mesh_id) + "density    : " + dens_path.string());
+  status(args, shared, mesh_prefix("start", mesh_id) + "density sz : " + dens_sz_path.string());
+
+  bsmv::S3dReader temp_reader(temp_path);
+  bsmv::S3dReader dens_reader(dens_path);
+  const auto dens_sizes = bsmv::read_s3d_size_file(dens_sz_path);
+
+  std::vector<bsmv::ManifestFrameInfo> manifest_frames;
+  if (args.start && args.stop && *args.stop > *args.start && args.stride > 0) {
+    const auto nsel = std::max(0, (*args.stop - *args.start + args.stride - 1) / args.stride);
+    manifest_frames.reserve(static_cast<std::size_t>(nsel));
+  }
+
+  constexpr float ambient_c = 20.0f;
+  const float temp_min_smv = static_cast<float>(smv.temp_min);
+  const float temp_max_smv = static_cast<float>(smv.temp_max);
+
+  bsmv::S3dFrame temp_frame, dens_frame;
+  int iframe = 0;
+  while (true) {
+    if (g_stop_requested) break;
+
+    const bool ok_t = temp_reader.next_frame(temp_frame);
+    const bool ok_d = dens_reader.next_frame(dens_frame);
+
+    if (!ok_t || !ok_d) {
+      if (ok_t != ok_d) {
+        status(args, shared, mesh_prefix("warn", mesh_id) +
+                                 "temperature/density frame counts differ; ending mesh early");
+      }
+      break;
+    }
+
+    if (iframe >= static_cast<int>(dens_sizes.size())) {
+      status(args, shared, mesh_prefix("warn", mesh_id) +
+                               "density .sz ended at frame " + std::to_string(iframe) +
+                               "; ending mesh early");
+      break;
+    }
+
+    const auto &dens_sz = dens_sizes[static_cast<std::size_t>(iframe)];
+
+    float dens_max = 0.0f;
+    std::string sz_choice;
+    if (!select_density_max(dens_sz, dens_frame, dens_max, sz_choice)) {
+      std::ostringstream oss;
+      oss << "density .sz mismatch at frame " << iframe
+          << " (binary nchars_in=" << dens_frame.nchars_in
+          << ", nchars_out=" << dens_frame.nchars_out
+          << "; sz primary="
+          << (dens_sz.has_primary ? std::to_string(dens_sz.nchars_out) : std::string("none"))
+          << ", secondary="
+          << (dens_sz.has_secondary ? std::to_string(dens_sz.nchars_out2) : std::string("none"))
+          << "); ending mesh early";
+      status(args, shared, mesh_prefix("warn", mesh_id) + oss.str());
+      break;
+    }
+
+    if (!nearly_equal(dens_sz.time, static_cast<double>(dens_frame.time))) {
+      status(args, shared, mesh_prefix("warn", mesh_id) +
+                               "density .sz time mismatch at frame " + std::to_string(iframe) +
+                               " using " + sz_choice + " pair");
+    }
+
+    const bool take = (!args.start || iframe >= *args.start) &&
+                      (!args.stop || iframe < *args.stop) &&
+                      ((iframe - (args.start ? *args.start : 0)) % args.stride == 0);
+
+    if (take) {
+      auto temperature = bsmv::decode_temperature_excess_c(
+          temp_frame.values, temp_min_smv, temp_max_smv, ambient_c);
+      auto density = bsmv::decode_density_linear(dens_frame.values, dens_max);
+
+      const std::string out_name =
+          args.chid + "_mesh_" + zero4(mesh_id) + "_frame_" + zero4(iframe) + ".vdb";
+      const fs::path out_path = args.out_dir / out_name;
+      bsmv::write_vdb(out_path, temperature, density, temp_reader.header().nx,
+                      temp_reader.header().ny, temp_reader.header().nz);
+
+      const auto [tmin, tmax] = bsmv::minmax(temperature);
+      const auto [dmin, dmax] = bsmv::minmax(density);
+
+      bsmv::ManifestFrameInfo info;
+      info.frame_index = iframe;
+      info.time = static_cast<double>(temp_frame.time);
+      info.filename = out_name;
+      info.temperature_min = tmin;
+      info.temperature_max = tmax;
+      info.density_min = dmin;
+      info.density_max = dmax;
+      manifest_frames.push_back(info);
+
+      if (!args.quiet && (static_cast<int>(manifest_frames.size()) % args.progress_every == 0)) {
+        status(args, shared,
+               mesh_prefix("prog", mesh_id) +
+               "wrote " + std::to_string(manifest_frames.size()) +
+               " frames (latest frame " + std::to_string(iframe) +
+               ", time " + std::to_string(temp_frame.time) + ")");
+      }
+    }
+
+    ++iframe;
+  }
+
+  const fs::path manifest_path = args.out_dir / (args.chid + "_mesh_" + zero4(mesh_id) + "_manifest.json");
+  bsmv::write_manifest(
+      manifest_path,
+      args.chid,
+      mesh_id,
+      grid.x,
+      grid.y,
+      grid.z,
+      manifest_frames,
+      ambient_c,
+      temp_min_smv,
+      temp_max_smv,
+      dens_ent.value);
+
+  status(args, shared, mesh_prefix("done", mesh_id) +
+                           "finished with " + std::to_string(manifest_frames.size()) + " written frames");
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
   try {
     const Args args = parse_args(argc, argv);
 
-    status(args, "Parsing SMV: " + args.smv_path.string());
+    std::signal(SIGINT, handle_sigint);
+
+    SharedState shared;
+
+    status(args, shared, "Parsing SMV: " + args.smv_path.string());
     const bsmv::SmvData smv = bsmv::parse_smv_file(args.smv_path);
 
     auto temp_by_mesh = bsmv::find_smokf3d_entries(smv, args.temperature_quantity);
@@ -128,125 +333,62 @@ int main(int argc, char **argv) {
     }
 
     fs::create_directories(args.out_dir);
-    status(args, "Writing VDB sequences to: " + fs::absolute(args.out_dir).string());
+    status(args, shared, "Writing VDB sequences to: " + fs::absolute(args.out_dir).string());
 
-    constexpr float ambient_c = 20.0f;
-    const float temp_min_smv = static_cast<float>(smv.temp_min);
-    const float temp_max_smv = static_cast<float>(smv.temp_max);
+    openvdb::initialize();
 
-    int mesh_counter = 0;
-    for (const int mesh_id : meshes) {
-      ++mesh_counter;
-      const auto grid_it = smv.grids.find(mesh_id);
-      if (grid_it == smv.grids.end()) {
-        throw std::runtime_error("Missing grid metadata for mesh " + std::to_string(mesh_id));
-      }
-      const auto &grid = grid_it->second;
-      const auto &temp_ent = temp_by_mesh.at(mesh_id);
-      const auto &dens_ent = dens_by_mesh.at(mesh_id);
-
-      const fs::path temp_path = args.result_dir / fs::path(temp_ent.filename).filename();
-      const fs::path dens_path = args.result_dir / fs::path(dens_ent.filename).filename();
-      const fs::path dens_sz_path = dens_path.string() + ".sz";
-
-      status(args, "Starting mesh " + std::to_string(mesh_id) + " (" +
-                       std::to_string(mesh_counter) + "/" + std::to_string(meshes.size()) + ")");
-      status(args, "  temperature: " + temp_path.string());
-      status(args, "  density    : " + dens_path.string());
-      status(args, "  density sz : " + dens_sz_path.string());
-
-      bsmv::S3dReader temp_reader(temp_path);
-      bsmv::S3dReader dens_reader(dens_path);
-      const auto dens_sizes = bsmv::read_s3d_size_file(dens_sz_path);
-
-      std::vector<bsmv::ManifestFrameInfo> manifest_frames;
-
-      bsmv::S3dFrame temp_frame, dens_frame;
-      int iframe = 0;
-      while (true) {
-        const bool ok_t = temp_reader.next_frame(temp_frame);
-        const bool ok_d = dens_reader.next_frame(dens_frame);
-        if (ok_t != ok_d) {
-          throw std::runtime_error("Temperature and density frame counts differ for mesh " + std::to_string(mesh_id));
-        }
-        if (!ok_t) break;
-
-        if (iframe >= static_cast<int>(dens_sizes.size())) {
-          throw std::runtime_error("Density .sz file has fewer frames than .s3d for mesh " + std::to_string(mesh_id));
-        }
-        const auto &dens_sz = dens_sizes[static_cast<std::size_t>(iframe)];
-        if (dens_sz.nchars_in != dens_frame.nchars_in || dens_sz.nchars_out != dens_frame.nchars_out) {
-          throw std::runtime_error("Density .sz nchars mismatch at frame " + std::to_string(iframe) +
-                                   " for mesh " + std::to_string(mesh_id));
-        }
-        if (!nearly_equal(dens_sz.time, static_cast<double>(dens_frame.time))) {
-          status(args, "WARNING: density .sz time mismatch at frame " + std::to_string(iframe) +
-                           " for mesh " + std::to_string(mesh_id));
-        }
-
-        const bool take = (!args.start || iframe >= *args.start) &&
-                          (!args.stop || iframe < *args.stop) &&
-                          ((iframe - (args.start ? *args.start : 0)) % args.stride == 0);
-
-        if (take) {
-          auto temperature = bsmv::decode_temperature_excess_c(
-              temp_frame.values, temp_min_smv, temp_max_smv, ambient_c);
-          auto density = bsmv::decode_density_linear(dens_frame.values, dens_sz.max_val);
-
-          const std::string out_name =
-              args.chid + "_mesh_" + zero4(mesh_id) + "_frame_" + zero4(iframe) + ".vdb";
-          const fs::path out_path = args.out_dir / out_name;
-          bsmv::write_vdb(out_path, temperature, density, temp_reader.header().nx,
-                          temp_reader.header().ny, temp_reader.header().nz);
-
-          const auto [tmin, tmax] = bsmv::minmax(temperature);
-          const auto [dmin, dmax] = bsmv::minmax(density);
-
-          bsmv::ManifestFrameInfo info;
-          info.frame_index = iframe;
-          info.time = static_cast<double>(temp_frame.time);
-          info.filename = out_name;
-          info.temperature_min = tmin;
-          info.temperature_max = tmax;
-          info.density_min = dmin;
-          info.density_max = dmax;
-          manifest_frames.push_back(info);
-
-          if (!args.quiet && (static_cast<int>(manifest_frames.size()) % args.progress_every == 0)) {
-            std::cout << "    wrote " << manifest_frames.size()
-                      << " frames for mesh " << mesh_id
-                      << " (latest frame " << iframe << ", time " << temp_frame.time << ")"
-                      << std::endl;
-          }
-        }
-
-        ++iframe;
-      }
-
-      if (static_cast<std::size_t>(iframe) != dens_sizes.size()) {
-        status(args, "WARNING: density .sz frame count differs from .s3d for mesh " + std::to_string(mesh_id));
-      }
-
-      const fs::path manifest_path = args.out_dir / (args.chid + "_mesh_" + zero4(mesh_id) + "_manifest.json");
-      bsmv::write_manifest(
-          manifest_path,
-          args.chid,
-          mesh_id,
-          grid.x,
-          grid.y,
-          grid.z,
-          manifest_frames,
-          ambient_c,
-          temp_min_smv,
-          temp_max_smv,
-          dens_ent.value);
-
-      status(args, "Finished mesh " + std::to_string(mesh_id) +
-                       " with " + std::to_string(manifest_frames.size()) + " written frames");
+    const unsigned hc = std::thread::hardware_concurrency();
+    int threads = std::max(1, args.threads);
+    if (!meshes.empty()) {
+      threads = std::min<int>(threads, static_cast<int>(meshes.size()));
+    }
+    if (hc > 0) {
+      threads = std::min<int>(threads, static_cast<int>(hc));
     }
 
-    status(args, "Done.");
-    return 0;
+    status(args, shared, "Using " + std::to_string(threads) + " thread(s) over " +
+                             std::to_string(meshes.size()) + " mesh(es)");
+
+    auto worker = [&](int worker_id) {
+      (void)worker_id;
+      while (!g_stop_requested) {
+        const std::size_t idx = shared.next_mesh_index.fetch_add(1);
+        if (idx >= meshes.size()) break;
+
+        const int mesh_id = meshes[idx];
+        shared.meshes_started.fetch_add(1);
+
+        try {
+          process_mesh(args, shared, smv, temp_by_mesh, dens_by_mesh, mesh_id);
+          shared.meshes_completed.fetch_add(1);
+        } catch (const std::exception &e) {
+          shared.meshes_failed.fetch_add(1);
+          status(args, shared, mesh_prefix("fail", mesh_id) + e.what());
+          continue;
+        }
+      }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<std::size_t>(threads));
+    for (int i = 0; i < threads; ++i) {
+      workers.emplace_back(worker, i);
+    }
+    for (auto &t : workers) {
+      t.join();
+    }
+
+    if (g_stop_requested) {
+      status(args, shared, "Interrupted. Started " + std::to_string(shared.meshes_started.load()) +
+                               ", completed " + std::to_string(shared.meshes_completed.load()) +
+                               ", failed " + std::to_string(shared.meshes_failed.load()) + ".");
+      return shared.meshes_failed.load() > 0 ? 1 : 130;
+    }
+
+    status(args, shared, "Done. Started " + std::to_string(shared.meshes_started.load()) +
+                             ", completed " + std::to_string(shared.meshes_completed.load()) +
+                             ", failed " + std::to_string(shared.meshes_failed.load()) + ".");
+    return shared.meshes_failed.load() > 0 ? 1 : 0;
   } catch (const std::exception &e) {
     std::cerr << "ERROR: " << e.what() << std::endl;
     return 1;

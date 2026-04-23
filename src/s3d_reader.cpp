@@ -158,11 +158,9 @@ std::vector<S3dSizeFrame> read_s3d_size_file(const std::filesystem::path &path) 
     std::istringstream iss(line);
     std::vector<double> vals;
     double x = 0.0;
-    while (iss >> x) {
-      vals.push_back(x);
-    }
+    while (iss >> x) vals.push_back(x);
 
-    // Skip header/count lines like just "0"
+    // Skip count/header-only lines like "0"
     if (vals.size() < 4) continue;
 
     S3dSizeFrame fr;
@@ -170,14 +168,16 @@ std::vector<S3dSizeFrame> read_s3d_size_file(const std::filesystem::path &path) 
     fr.nchars_in = static_cast<std::int32_t>(std::lround(vals[1]));
 
     if (vals.size() >= 6) {
-      // Newer density .sz format:
-      //   TIME NCHARS_IN old_nchars_out old_max new_nchars_out new_max
-      // Use the LAST pair, which matches the current .s3d payload.
-      fr.nchars_out = static_cast<std::int32_t>(std::lround(vals[4]));
-      fr.max_val = static_cast<float>(vals[5]);
+      // Keep BOTH candidate pairs. Older/newer files are inconsistent.
+      fr.has_primary = true;
+      fr.nchars_out = static_cast<std::int32_t>(std::lround(vals[2]));
+      fr.max_val = static_cast<float>(vals[3]);
+
+      fr.has_secondary = true;
+      fr.nchars_out2 = static_cast<std::int32_t>(std::lround(vals[4]));
+      fr.max_val2 = static_cast<float>(vals[5]);
     } else {
-      // Classic format:
-      //   TIME NCHARS_IN NCHARS_OUT MAX_VAL
+      fr.has_primary = true;
       fr.nchars_out = static_cast<std::int32_t>(std::lround(vals[2]));
       fr.max_val = static_cast<float>(vals[3]);
     }

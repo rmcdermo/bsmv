@@ -52,7 +52,6 @@ void write_vdb(
     const std::vector<float> &temperature,
     const std::vector<float> &density,
     int nx, int ny, int nz) {
-  openvdb::initialize();
 
   auto temp_grid = openvdb::FloatGrid::create(/*background=*/0.0f);
   temp_grid->setName("temperature");
