@@ -283,4 +283,152 @@ void write_geometry_manifest(
   out << "}\n";
 }
 
+
+namespace {
+
+std::array<double, 6> mesh_bbox(const MeshGrid &g) {
+  if (g.x.empty() || g.y.empty() || g.z.empty()) {
+    return {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  }
+  return {g.x.front(), g.x.back(), g.y.front(), g.y.back(), g.z.front(), g.z.back()};
+}
+
+std::array<double, 6> domain_bbox_from_grids(const std::map<int, MeshGrid> &grids) {
+  bool first = true;
+  std::array<double, 6> bbox = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  for (const auto &kv : grids) {
+    const auto b = mesh_bbox(kv.second);
+    if (first) {
+      bbox = b;
+      first = false;
+    } else {
+      bbox[0] = std::min(bbox[0], b[0]);
+      bbox[1] = std::max(bbox[1], b[1]);
+      bbox[2] = std::min(bbox[2], b[2]);
+      bbox[3] = std::max(bbox[3], b[3]);
+      bbox[4] = std::min(bbox[4], b[4]);
+      bbox[5] = std::max(bbox[5], b[5]);
+    }
+  }
+  return bbox;
+}
+
+void write_bbox_json(std::ostream &out, const std::array<double, 6> &b) {
+  out << "[" << b[0] << ", " << b[1] << ", "
+      << b[2] << ", " << b[3] << ", "
+      << b[4] << ", " << b[5] << "]";
+}
+
+void write_rgb_json(std::ostream &out, const std::array<double, 3> &rgb) {
+  out << "[" << rgb[0] << ", " << rgb[1] << ", " << rgb[2] << "]";
+}
+
+}  // namespace
+
+void write_scene_manifest(
+    const std::filesystem::path &path,
+    const SmvData &smv) {
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("Could not write scene manifest: " + path.string());
+
+  const auto domain_bbox = domain_bbox_from_grids(smv.grids);
+
+  out << std::fixed << std::setprecision(9);
+  out << "{\n";
+  out << "  \"format\": \"bsmv_scene_v1\",\n";
+  out << "  \"chid\": \"" << json_escape(smv.chid) << "\",\n";
+  out << "  \"default_surface_id\": \"" << json_escape(smv.default_surface_id) << "\",\n";
+  out << "  \"domain_bbox\": ";
+  write_bbox_json(out, domain_bbox);
+  out << ",\n";
+
+  out << "  \"meshes\": [\n";
+  std::size_t mesh_i = 0;
+  for (const auto &kv : smv.grids) {
+    const auto &g = kv.second;
+    out << "    {\n";
+    out << "      \"mesh_index_1based\": " << g.mesh_index_1based << ",\n";
+    out << "      \"ibar\": " << g.ibar << ", \"jbar\": " << g.jbar << ", \"kbar\": " << g.kbar << ",\n";
+    out << "      \"bbox\": ";
+    write_bbox_json(out, mesh_bbox(g));
+    out << "\n";
+    out << "    }" << (++mesh_i < smv.grids.size() ? "," : "") << "\n";
+  }
+  out << "  ],\n";
+
+  out << "  \"surfaces\": [\n";
+  for (std::size_t i = 0; i < smv.surfaces.size(); ++i) {
+    const auto &sf = smv.surfaces[i];
+    out << "    {\n";
+    out << "      \"surface_index\": " << sf.surface_index << ",\n";
+    out << "      \"id\": \"" << json_escape(sf.id) << "\",\n";
+    out << "      \"surf_type\": " << sf.surf_type << ",\n";
+    out << "      \"rgb\": ";
+    write_rgb_json(out, sf.rgb);
+    out << ",\n";
+    out << "      \"transparency\": " << sf.transparency << ",\n";
+    out << "      \"texture_map\": \"" << json_escape(sf.texture_map) << "\"\n";
+    out << "    }" << (i + 1 < smv.surfaces.size() ? "," : "") << "\n";
+  }
+  out << "  ],\n";
+
+  out << "  \"vent_orig\": [\n";
+  for (std::size_t i = 0; i < smv.vent_orig.size(); ++i) {
+    const auto &vo = smv.vent_orig[i];
+    out << "    {\n";
+    out << "      \"vent_index_1based\": " << vo.vent_index_1based << ",\n";
+    out << "      \"id\": \"" << json_escape(vo.id) << "\",\n";
+    out << "      \"bbox\": ";
+    write_bbox_json(out, vo.bbox);
+    out << ",\n";
+    out << "      \"raw_line\": \"" << json_escape(vo.raw_line) << "\"\n";
+    out << "    }" << (i + 1 < smv.vent_orig.size() ? "," : "") << "\n";
+  }
+  out << "  ],\n";
+
+  out << "  \"vents\": [\n";
+  for (std::size_t i = 0; i < smv.vents.size(); ++i) {
+    const auto &vt = smv.vents[i];
+    out << "    {\n";
+    out << "      \"mesh_index_1based\": " << vt.mesh_index_1based << ",\n";
+    out << "      \"vent_index_1based\": " << vt.vent_index_1based << ",\n";
+    out << "      \"circular\": " << (vt.circular ? "true" : "false") << ",\n";
+    out << "      \"has_bbox\": " << (vt.has_bbox ? "true" : "false") << ",\n";
+    out << "      \"bbox\": ";
+    write_bbox_json(out, vt.bbox);
+    out << ",\n";
+    out << "      \"ordinal\": " << vt.ordinal << ",\n";
+    out << "      \"surf_index\": " << vt.surf_index << ",\n";
+    out << "      \"color_index\": " << vt.color_index << ",\n";
+    out << "      \"type_index\": " << vt.type_index << ",\n";
+    out << "      \"ior\": " << vt.ior << ",\n";
+    out << "      \"has_rgb\": " << (vt.has_rgb ? "true" : "false") << ",\n";
+    out << "      \"rgb\": ";
+    write_rgb_json(out, vt.rgb);
+    out << ",\n";
+    out << "      \"transparency\": " << vt.transparency << ",\n";
+    out << "      \"center\": ";
+    write_rgb_json(out, vt.center);
+    out << ",\n";
+    out << "      \"radius\": " << vt.radius << ",\n";
+    out << "      \"raw_geometry_line\": \"" << json_escape(vt.raw_geometry_line) << "\",\n";
+    out << "      \"raw_display_line\": \"" << json_escape(vt.raw_display_line) << "\"\n";
+    out << "    }" << (i + 1 < smv.vents.size() ? "," : "") << "\n";
+  }
+  out << "  ],\n";
+
+  out << "  \"obstacles\": [\n";
+  for (std::size_t i = 0; i < smv.obstacles.size(); ++i) {
+    const auto &ob = smv.obstacles[i];
+    out << "    {\n";
+    out << "      \"mesh_index_1based\": " << ob.mesh_index_1based << ",\n";
+    out << "      \"obst_index_1based\": " << ob.obst_index_1based << ",\n";
+    out << "      \"raw_line\": \"" << json_escape(ob.raw_line) << "\"\n";
+    out << "    }" << (i + 1 < smv.obstacles.size() ? "," : "") << "\n";
+  }
+  out << "  ]\n";
+
+  out << "}\n";
+}
+
 }  // namespace bsmv

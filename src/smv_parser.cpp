@@ -39,6 +39,23 @@ std::vector<std::string> split_ws(const std::string &s) {
   return out;
 }
 
+std::vector<std::string> split_ws_before_comment(const std::string &s) {
+  std::string t = s;
+  const auto bang = t.find('!');
+  const auto pct = t.find('%');
+  std::size_t cut = std::string::npos;
+  if (bang != std::string::npos) cut = bang;
+  if (pct != std::string::npos) cut = std::min(cut, pct);
+  if (cut != std::string::npos) t = t.substr(0, cut);
+  return split_ws(t);
+}
+
+std::string after_marker(const std::string &s, char marker) {
+  const auto p = s.find(marker);
+  if (p == std::string::npos) return {};
+  return trim(s.substr(p + 1));
+}
+
 bool parse_int_token(const std::string &tok, int &value) {
   try {
     std::size_t pos = 0;
@@ -104,14 +121,194 @@ bool looks_like_new_smv_keyword(const std::string &s) {
   if (u.empty()) return false;
 
   static const char *keys[] = {
-      "CHID",      "GRID",      "TRNX",     "TRNY",     "TRNZ",
-      "SMOKF3D",   "GEOM",      "BOXGEOM",  "SLCF",     "BNDF",
-      "BNDE",      "ISOF",      "PRT5",     "DEVICE",   "VIEWTIMES",
-      "HRRPUV_MINMAX", "TEMP_MINMAX", "CLASS_OF_PARTICLES", "CSVF"};
+      "CHID", "GRID", "TRNX", "TRNY", "TRNZ",
+      "SMOKF3D", "GEOM", "BOXGEOM", "SLCF", "BNDF",
+      "BNDE", "ISOF", "PRT5", "DEVICE", "VIEWTIMES",
+      "HRRPUV_MINMAX", "TEMP_MINMAX", "CLASS_OF_PARTICLES", "CSVF",
+      "SURFDEF", "SURFACE", "VENTORIG", "OBST", "VENT", "CVENT",
+      "IBLANK", "GVEC", "ALBEDO", "FDSVERSION", "INPF", "REVISION",
+      "NMESHES", "TIMES", "OUTLINE", "TERRAINIMAGE", "CADGEOM"};
   for (const char *k : keys) {
     if (u == k || u.rfind(std::string(k) + " ", 0) == 0) return true;
   }
   return false;
+}
+
+SurfaceInfo parse_surface_block(const std::vector<std::string> &lines, int &i, int surface_index) {
+  SurfaceInfo sf;
+  sf.surface_index = surface_index;
+
+  i = next_nonempty(lines, i + 1);
+  if (i >= static_cast<int>(lines.size())) return sf;
+  sf.id = trim(lines[i]);
+
+  i = next_nonempty(lines, i + 1);
+  if (i < static_cast<int>(lines.size())) {
+    const auto toks = split_ws_before_comment(lines[i]);
+    if (toks.size() >= 2) {
+      parse_double_token(toks[0], sf.temperature);
+      parse_double_token(toks[1], sf.emissivity);
+    }
+  }
+
+  i = next_nonempty(lines, i + 1);
+  if (i < static_cast<int>(lines.size())) {
+    const auto toks = split_ws_before_comment(lines[i]);
+    if (toks.size() >= 7) {
+      parse_int_token(toks[0], sf.surf_type);
+      parse_double_token(toks[1], sf.texture_width);
+      parse_double_token(toks[2], sf.texture_height);
+      parse_double_token(toks[3], sf.rgb[0]);
+      parse_double_token(toks[4], sf.rgb[1]);
+      parse_double_token(toks[5], sf.rgb[2]);
+      parse_double_token(toks[6], sf.transparency);
+    }
+  }
+
+  i = next_nonempty(lines, i + 1);
+  if (i < static_cast<int>(lines.size())) {
+    sf.texture_map = trim(lines[i]);
+  }
+
+  ++i;
+  return sf;
+}
+
+VentOrigInfo parse_ventorig_line(const std::string &line, int index_1based) {
+  VentOrigInfo vo;
+  vo.vent_index_1based = index_1based;
+  vo.raw_line = trim(line);
+  vo.id = after_marker(line, '!');
+
+  const auto toks = split_ws_before_comment(line);
+  if (toks.size() >= 6) {
+    for (int q = 0; q < 6; ++q) parse_double_token(toks[static_cast<std::size_t>(q)], vo.bbox[static_cast<std::size_t>(q)]);
+  }
+  return vo;
+}
+
+VentInfo parse_vent_pair(
+    const std::string &geom_line,
+    const std::string &display_line,
+    int mesh_index_1based,
+    int vent_index_1based,
+    bool circular) {
+  VentInfo vt;
+  vt.mesh_index_1based = mesh_index_1based;
+  vt.vent_index_1based = vent_index_1based;
+  vt.circular = circular;
+  vt.raw_geometry_line = trim(geom_line);
+  vt.raw_display_line = trim(display_line);
+
+  const auto gtoks = split_ws_before_comment(geom_line);
+  if (gtoks.size() >= 6) {
+    bool ok = true;
+    for (int q = 0; q < 6; ++q) {
+      if (!parse_double_token(gtoks[static_cast<std::size_t>(q)], vt.bbox[static_cast<std::size_t>(q)])) ok = false;
+    }
+    vt.has_bbox = ok;
+  }
+  if (gtoks.size() >= 8) {
+    parse_int_token(gtoks[6], vt.ordinal);
+    parse_int_token(gtoks[7], vt.surf_index);
+  }
+
+  // Circular vents have center/radius after a '%' marker.
+  if (circular) {
+    const auto pct = geom_line.find('%');
+    if (pct != std::string::npos) {
+      const auto ctoks = split_ws(geom_line.substr(pct + 1));
+      if (ctoks.size() >= 4) {
+        parse_double_token(ctoks[0], vt.center[0]);
+        parse_double_token(ctoks[1], vt.center[1]);
+        parse_double_token(ctoks[2], vt.center[2]);
+        parse_double_token(ctoks[3], vt.radius);
+      }
+    }
+  }
+
+  const auto dtoks = split_ws_before_comment(display_line);
+  if (dtoks.size() >= 8) {
+    parse_int_token(dtoks[6], vt.color_index);
+    parse_int_token(dtoks[7], vt.type_index);
+  }
+  if (dtoks.size() >= 12) {
+    bool ok = true;
+    ok = parse_double_token(dtoks[8], vt.rgb[0]) && ok;
+    ok = parse_double_token(dtoks[9], vt.rgb[1]) && ok;
+    ok = parse_double_token(dtoks[10], vt.rgb[2]) && ok;
+    ok = parse_double_token(dtoks[11], vt.transparency) && ok;
+    vt.has_rgb = ok;
+  }
+
+  const std::string ior_text = after_marker(display_line, '!');
+  if (!ior_text.empty()) {
+    const auto itoks = split_ws(ior_text);
+    if (!itoks.empty()) parse_int_token(itoks[0], vt.ior);
+  }
+
+  return vt;
+}
+
+void parse_vent_block(
+    const std::vector<std::string> &lines,
+    int &i,
+    int current_mesh_index,
+    bool circular,
+    std::vector<VentInfo> &vents) {
+  const auto toks = split_ws(lines[i]);
+  const int nvent = parse_optional_count_after_keyword(lines, i, toks);
+
+  ++i;
+  std::vector<std::string> geom_lines;
+  geom_lines.reserve(static_cast<std::size_t>(std::max(0, nvent)));
+  for (int n = 0; n < nvent; ++n) {
+    i = next_nonempty(lines, i);
+    if (i >= static_cast<int>(lines.size()) || looks_like_new_smv_keyword(lines[i])) break;
+    geom_lines.push_back(lines[i]);
+    ++i;
+  }
+
+  std::vector<std::string> display_lines;
+  display_lines.reserve(geom_lines.size());
+  for (std::size_t n = 0; n < geom_lines.size(); ++n) {
+    i = next_nonempty(lines, i);
+    if (i >= static_cast<int>(lines.size()) || looks_like_new_smv_keyword(lines[i])) break;
+    display_lines.push_back(lines[i]);
+    ++i;
+  }
+
+  const std::size_t npair = std::min(geom_lines.size(), display_lines.size());
+  for (std::size_t n = 0; n < npair; ++n) {
+    vents.push_back(parse_vent_pair(
+        geom_lines[n],
+        display_lines[n],
+        current_mesh_index,
+        static_cast<int>(n + 1),
+        circular));
+  }
+}
+
+void parse_obst_block(
+    const std::vector<std::string> &lines,
+    int &i,
+    int current_mesh_index,
+    std::vector<ObstInfo> &obstacles) {
+  const auto toks = split_ws(lines[i]);
+  const int nobst = parse_optional_count_after_keyword(lines, i, toks);
+  ++i;
+
+  for (int n = 0; n < nobst; ++n) {
+    i = next_nonempty(lines, i);
+    if (i >= static_cast<int>(lines.size()) || looks_like_new_smv_keyword(lines[i])) break;
+
+    ObstInfo ob;
+    ob.mesh_index_1based = current_mesh_index;
+    ob.obst_index_1based = n + 1;
+    ob.raw_line = trim(lines[i]);
+    obstacles.push_back(std::move(ob));
+    ++i;
+  }
 }
 
 }  // namespace
@@ -145,6 +342,7 @@ SmvData parse_smv_file(const std::filesystem::path &path) {
   const auto lines = read_lines(path);
   SmvData smv;
   int i = 0;
+  int current_mesh_index = 0;
 
   while (i < static_cast<int>(lines.size())) {
     i = next_nonempty(lines, i);
@@ -182,6 +380,46 @@ SmvData parse_smv_file(const std::filesystem::path &path) {
         }
       }
       ++i;
+      continue;
+    }
+
+    if (key == "SURFDEF") {
+      i = next_nonempty(lines, i + 1);
+      if (i < static_cast<int>(lines.size())) smv.default_surface_id = trim(lines[i]);
+      ++i;
+      continue;
+    }
+
+    if (key == "SURFACE") {
+      smv.surfaces.push_back(parse_surface_block(lines, i, static_cast<int>(smv.surfaces.size())));
+      continue;
+    }
+
+    if (key == "VENTORIG") {
+      const auto toks = split_ws(lines[i]);
+      const int nvent = parse_optional_count_after_keyword(lines, i, toks);
+      ++i;
+      for (int n = 0; n < nvent; ++n) {
+        i = next_nonempty(lines, i);
+        if (i >= static_cast<int>(lines.size()) || looks_like_new_smv_keyword(lines[i])) break;
+        smv.vent_orig.push_back(parse_ventorig_line(lines[i], n + 1));
+        ++i;
+      }
+      continue;
+    }
+
+    if (key == "OBST") {
+      parse_obst_block(lines, i, current_mesh_index, smv.obstacles);
+      continue;
+    }
+
+    if (key == "VENT") {
+      parse_vent_block(lines, i, current_mesh_index, false, smv.vents);
+      continue;
+    }
+
+    if (key == "CVENT") {
+      parse_vent_block(lines, i, current_mesh_index, true, smv.vents);
       continue;
     }
 
@@ -264,6 +502,7 @@ SmvData parse_smv_file(const std::filesystem::path &path) {
       grid.jbar = std::stoi(toks[1]);
       grid.kbar = std::stoi(toks[2]);
       grid.mesh_index_1based = static_cast<int>(smv.grids.size()) + 1;
+      current_mesh_index = grid.mesh_index_1based;
       ++i;
 
       bool got_x = false, got_y = false, got_z = false;
@@ -307,8 +546,7 @@ SmvData parse_smv_file(const std::filesystem::path &path) {
           got_z = true;
           break;
         }
-        if (subkey.rfind("SMOKF3D", 0) == 0 || subkey.rfind("GRID", 0) == 0 ||
-            subkey.rfind("GEOM", 0) == 0 || subkey.rfind("BOXGEOM", 0) == 0) {
+        if (looks_like_new_smv_keyword(lines[i])) {
           break;
         }
         ++i;

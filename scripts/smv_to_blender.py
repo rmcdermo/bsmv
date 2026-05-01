@@ -1,1113 +1,532 @@
-
-#!/usr/bin/env python3
-"""
-Read an FDS/Smokeview .smv file and create corresponding geometry in Blender.
-
-Updated to:
-- parse CVENT blocks (circular vents)
-- optionally read the sibling .fds file (<chid>.fds) for circular vent metadata
-  and SURF COLOR names
-- use those colors for circular pool vents such as LNG_POOL and WATER_POOL
-
-Two ways to use this script:
-
-1. From Terminal:
-
-   blender --python smv_to_blender.py --chid simple_test
-
-2. From Blender's Text Editor:
-
-   - open this file in the Scripting workspace
-   - edit the BLENDER_* settings below if needed
-   - press Alt-P (Run Script)
-
-Optional from Blender's Python Console:
-
-   import runpy
-   ns = runpy.run_path('/full/path/smv_to_blender.py')
-   ns['run'](chid='simple_test', smv_dir='/full/path/to/case_dir')
-"""
+# smv_to_blender.py
+#
+# Blender-side loader for bsmv output.
+# This version:
+#   - imports bsmv OBJ GEOM with FDS/Blender z-up orientation preserved
+#   - reads geometry/scene_manifest.json
+#   - draws the global domain box, optional mesh boxes, and rectangular vents
+#   - then optionally starts VDB loading
 
 from __future__ import annotations
 
-import argparse
+import json
 import math
 import re
-import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import bpy
 from mathutils import Vector
 
-EPS = 1.0e-9
 
 # -----------------------------------------------------------------------------
-# Blender Text Editor defaults
+# User settings
 # -----------------------------------------------------------------------------
 
 BLENDER_AUTORUN = True
-BLENDER_CHID = "simple_test"
-BLENDER_SMV_DIR = None
-BLENDER_SMV_PATH = None
 
-BLENDER_OPEN_OUTLINE = True
-BLENDER_ROOM_OUTLINE = False
-BLENDER_SHOW_OPEN_FACE = False
-BLENDER_OPEN_FRAME_WIDTH = 0.01
-BLENDER_SHOW_MESH_SEAMS = False
-BLENDER_OPEN_IN_RENDER = False
-BLENDER_CIRCLE_VERTS = 128
+BLENDER_CHID = "FM_15cm_Burner_C2H4_20p9_2cm"
+
+# Absolute paths are safest. Relative paths are resolved relative to the saved
+# .blend file if there is one, otherwise relative to Blender's current directory.
+BLENDER_VDB_DIR = "/Users/rmcdermo/spark_home/rmcdermo/GitHub/firemodels/fds/Validation/FM_Burner/Blender_Test/vdb_sequence"
+BLENDER_GEOM_DIR = "/Users/rmcdermo/spark_home/rmcdermo/GitHub/firemodels/fds/Validation/FM_Burner/Blender_Test/geometry"
+
+BLENDER_LOAD_GEOM = True
+BLENDER_LOAD_SCENE = True
+BLENDER_LOAD_VDB = False
+
+BLENDER_CLEAR_SCENE = True
+
+# For very large cases, keep this modest for viewport sanity. None loads all.
+BLENDER_MAX_MESHES = None
+
+# Only make the first N VDB volume objects visible initially.
+BLENDER_VISIBLE_COUNT = 12
+
+BLENDER_SKIP_EXISTING_GEOM = True
+BLENDER_SKIP_EXISTING_VDB = True
+
+BLENDER_DRAW_DOMAIN_BOX = True
+BLENDER_DRAW_MESH_BOXES = False
+BLENDER_DRAW_VENTS = True
+
+BLENDER_ADD_BASIC_CAMERA_AND_LIGHT = True
+BLENDER_SET_CLIP_DISTANCES = True
+
 
 # -----------------------------------------------------------------------------
-# Color helpers
+# Utilities
 # -----------------------------------------------------------------------------
 
-FDS_NAMED_COLORS: Dict[str, Tuple[float, float, float, float]] = {
-   "BLACK":      (0.00, 0.00, 0.00, 1.0),
-   "WHITE":      (1.00, 1.00, 1.00, 1.0),
-   "RED":        (1.00, 0.00, 0.00, 1.0),
-   "GREEN":      (0.00, 1.00, 0.00, 1.0),
-   "BLUE":       (0.00, 0.00, 1.00, 1.0),
-   "YELLOW":     (1.00, 1.00, 0.00, 1.0),
-   "CYAN":       (0.00, 1.00, 1.00, 1.0),
-   "MAGENTA":    (1.00, 0.00, 1.00, 1.0),
-   "AQUA":       (0.00, 1.00, 1.00, 1.0),
-   "AQUAMARINE": (0.498, 1.000, 0.831, 1.0),
-   "GRAY":       (0.50, 0.50, 0.50, 1.0),
-   "GREY":       (0.50, 0.50, 0.50, 1.0),
-   "SILVER":     (0.75, 0.75, 0.75, 1.0),
-   "ORANGE":     (1.00, 0.65, 0.00, 1.0),
-   "BROWN":      (0.65, 0.16, 0.16, 1.0),
-   "TAN":        (0.82, 0.71, 0.55, 1.0),
-   "PURPLE":     (0.50, 0.00, 0.50, 1.0),
-   "PINK":       (1.00, 0.75, 0.80, 1.0),
-}
+def abs_path(p: str | Path) -> Path:
+    s = str(p)
 
-def choose_surface_color(surface_name: str,
-                         surface_color_name: Optional[str] = None,
-                         surface_rgba: Optional[Tuple[float, float, float, float]] = None) -> Tuple[float, float, float, float]:
-   if surface_color_name:
-      rgba = FDS_NAMED_COLORS.get(surface_color_name.strip().upper())
-      if rgba is not None:
-         return rgba
+    # Only expand the current user's ~/ shorthand. Do not expand strings like
+    # ~spark_home, because Python treats that as "home directory of user spark_home".
+    if s == "~" or s.startswith("~/"):
+        path = Path(s).expanduser()
+    else:
+        path = Path(s)
 
-   if surface_rgba is not None:
-      return surface_rgba
+    if path.is_absolute():
+        return path.resolve()
 
-   s = surface_name.upper()
-   if s == "INERT":
-      return (0.93, 0.74, 0.31, 1.0)
-   if "BURNER" in s:
-      return (1.00, 0.08, 0.02, 1.0)
-   if "OPEN" in s:
-      return (1.00, 1.00, 1.00, 0.05)
-   return (0.75, 0.75, 0.75, 1.0)
+    if bpy.data.filepath:
+        return (Path(bpy.data.filepath).parent / path).resolve()
+
+    return path.resolve()
+
+
+def clear_scene() -> None:
+    bpy.ops.object.select_all(action="SELECT")
+    bpy.ops.object.delete()
+
+
+def get_or_create_collection(name: str) -> bpy.types.Collection:
+    coll = bpy.data.collections.get(name)
+    if coll is None:
+        coll = bpy.data.collections.new(name)
+        bpy.context.scene.collection.children.link(coll)
+    return coll
+
+
+def move_object_to_collection(obj: bpy.types.Object, coll: bpy.types.Collection) -> None:
+    if obj.name not in coll.objects:
+        coll.objects.link(obj)
+    try:
+        bpy.context.scene.collection.objects.unlink(obj)
+    except Exception:
+        pass
+
+
+def sanitize_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+
+
+def read_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
 
 # -----------------------------------------------------------------------------
-# Blender Text Editor path helper
+# Materials
 # -----------------------------------------------------------------------------
 
-def get_text_editor_script_path() -> Optional[Path]:
-   candidates: List[Path] = []
+def make_material(name: str, rgba=(0.7, 0.7, 0.7, 1.0)) -> bpy.types.Material:
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        mat = bpy.data.materials.new(name)
+        mat.diffuse_color = rgba
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf is not None:
+            if "Base Color" in bsdf.inputs:
+                bsdf.inputs["Base Color"].default_value = rgba
+            if "Alpha" in bsdf.inputs:
+                bsdf.inputs["Alpha"].default_value = rgba[3]
+            if "Roughness" in bsdf.inputs:
+                bsdf.inputs["Roughness"].default_value = 0.65
+        mat.blend_method = "BLEND"
+        mat.use_screen_refraction = False
+    return mat
 
-   try:
-      space = getattr(bpy.context, "space_data", None)
-      if space is not None and getattr(space, "type", None) == 'TEXT_EDITOR':
-         text_block = getattr(space, "text", None)
-         if text_block is not None:
-            fp = getattr(text_block, "filepath", "")
-            if fp:
-               candidates.append(Path(bpy.path.abspath(fp)).expanduser())
-   except Exception:
-      pass
 
-   try:
-      screen = getattr(bpy.context, "screen", None)
-      if screen is not None:
-         for area in screen.areas:
-            if area.type != 'TEXT_EDITOR':
-               continue
-            space = area.spaces.active
-            text_block = getattr(space, "text", None)
-            if text_block is not None:
-               fp = getattr(text_block, "filepath", "")
-               if fp:
-                  candidates.append(Path(bpy.path.abspath(fp)).expanduser())
-   except Exception:
-      pass
+def geom_material() -> bpy.types.Material:
+    return make_material("bsmv_geom_neutral", (0.55, 0.55, 0.55, 1.0))
 
-   try:
-      fp = globals().get("__file__", "")
-      if fp:
-         candidates.append(Path(fp).expanduser())
-   except Exception:
-      pass
 
-   try:
-      for text_block in bpy.data.texts:
-         fp = getattr(text_block, "filepath", "")
-         if fp:
-            candidates.append(Path(bpy.path.abspath(fp)).expanduser())
-   except Exception:
-      pass
+def domain_material() -> bpy.types.Material:
+    return make_material("bsmv_domain_wire", (0.2, 0.8, 1.0, 1.0))
 
-   seen = set()
-   for cand in candidates:
-      try:
-         rc = cand.resolve()
-      except Exception:
-         continue
-      key = str(rc)
-      if key in seen:
-         continue
-      seen.add(key)
-      if rc.exists():
-         return rc
 
-   return None
+def mesh_box_material() -> bpy.types.Material:
+    return make_material("bsmv_mesh_wire", (0.8, 0.8, 0.8, 0.35))
+
+
+def vent_material(rgb, alpha, suffix: str) -> bpy.types.Material:
+    r, g, b = rgb
+    a = max(0.05, min(1.0, alpha))
+    return make_material(f"bsmv_vent_{suffix}", (float(r), float(g), float(b), a))
+
 
 # -----------------------------------------------------------------------------
-# Generic parsing helpers
+# OBJ / GEOM import
 # -----------------------------------------------------------------------------
 
-def _next_nonempty(lines: List[str], i: int) -> int:
-   while i < len(lines) and lines[i].strip() == "":
-      i += 1
-   return i
+def import_obj(filepath: Path) -> list[bpy.types.Object]:
+    """Import OBJ and return all newly-created objects.
+
+    bsmv writes OBJ vertices directly as FDS x,y,z coordinates. FDS is z-up,
+    and Blender is also z-up. Therefore the OBJ importer must not do its usual
+    Y-up conversion.
+    """
+    before = set(bpy.data.objects.keys())
+
+    if hasattr(bpy.ops.wm, "obj_import"):
+        bpy.ops.wm.obj_import(
+            filepath=str(filepath),
+            forward_axis="Y",
+            up_axis="Z",
+            global_scale=1.0,
+            clamp_size=0.0,
+        )
+    elif hasattr(bpy.ops, "import_scene") and hasattr(bpy.ops.import_scene, "obj"):
+        bpy.ops.import_scene.obj(
+            filepath=str(filepath),
+            axis_forward="Y",
+            axis_up="Z",
+            global_scale=1.0,
+            clamp_size=0.0,
+        )
+    else:
+        raise RuntimeError("OBJ import operator not available in this Blender build.")
+
+    after = set(bpy.data.objects.keys())
+    return [bpy.data.objects[name] for name in sorted(after - before)]
 
 
-def _parse_float_list(text: str) -> List[float]:
-   vals: List[float] = []
-   for token in text.replace(",", " ").split():
-      try:
-         vals.append(float(token))
-      except ValueError:
-         pass
-   return vals
+def import_bsmv_geometry(geom_dir: str | Path, chid: str) -> list[bpy.types.Object]:
+    geom_dir = abs_path(geom_dir)
+    if not geom_dir.exists():
+        print(f"[geom] directory does not exist: {geom_dir}")
+        return []
 
+    obj_files = sorted(geom_dir.glob(f"{chid}_geom_*.obj"))
+    if not obj_files:
+        obj_files = sorted(geom_dir.glob("*_geom_*.obj"))
+    if not obj_files:
+        obj_files = sorted(geom_dir.glob("*.obj"))
 
-def _round_key(values: Tuple[float, ...], ndigits: int = 6) -> Tuple[float, ...]:
-   return tuple(round(v, ndigits) for v in values)
+    if not obj_files:
+        print(f"[geom] no OBJ files found in {geom_dir}")
+        return []
 
-# -----------------------------------------------------------------------------
-# FDS parsing (optional metadata / validation)
-# -----------------------------------------------------------------------------
+    coll = get_or_create_collection("bsmv_geometry")
+    mat = geom_material()
+    imported: list[bpy.types.Object] = []
 
-def parse_fds(path: Path) -> dict:
-   text = path.read_text()
-   text = re.sub(r'!.*', '', text)
-   records = []
-   for rec in text.split('/'):
-      rec = rec.strip()
-      if rec:
-         records.append(rec)
+    print(f"[geom] importing {len(obj_files)} OBJ file(s) from {geom_dir}")
 
-   data = {
-      "surface_color_names": {},
-      "circular_vents": [],
-   }
-
-   for rec in records:
-      rec_up = rec.upper()
-
-      if rec_up.startswith("&SURF"):
-         m_id = re.search(r"\bID\s*=\s*'([^']+)'", rec, re.I | re.S)
-         if m_id is None:
+    for obj_path in obj_files:
+        base_name = sanitize_name(obj_path.stem)
+        if BLENDER_SKIP_EXISTING_GEOM and bpy.data.objects.get(base_name) is not None:
+            print(f"[geom] skip existing {base_name}")
+            imported.append(bpy.data.objects[base_name])
             continue
-         surf_id = m_id.group(1).strip()
 
-         m_color = re.search(r"\bCOLOR\s*=\s*'([^']+)'", rec, re.I | re.S)
-         if m_color is not None:
-            data["surface_color_names"][surf_id] = m_color.group(1).strip()
-         continue
+        new_objs = import_obj(obj_path)
+        for n, obj in enumerate(new_objs):
+            obj.name = base_name if len(new_objs) == 1 else f"{base_name}_{n + 1:02d}"
+            obj.data.name = obj.name + "_mesh"
+            move_object_to_collection(obj, coll)
+            if hasattr(obj.data, "materials"):
+                obj.data.materials.clear()
+                obj.data.materials.append(mat)
+            obj.hide_viewport = False
+            obj.hide_render = False
+            imported.append(obj)
 
-      if rec_up.startswith("&VENT"):
-         m_radius = re.search(r"\bRADIUS\s*=\s*([-+0-9.Ee]+)", rec, re.I | re.S)
-         if m_radius is None:
+        print(f"[geom] imported {obj_path.name}")
+
+    return imported
+
+
+# -----------------------------------------------------------------------------
+# Scene manifest drawing: domain, mesh boxes, vents
+# -----------------------------------------------------------------------------
+
+def bbox_vertices_and_edges(bbox):
+    xmin, xmax, ymin, ymax, zmin, zmax = [float(x) for x in bbox]
+    verts = [
+        (xmin, ymin, zmin), (xmax, ymin, zmin),
+        (xmax, ymax, zmin), (xmin, ymax, zmin),
+        (xmin, ymin, zmax), (xmax, ymin, zmax),
+        (xmax, ymax, zmax), (xmin, ymax, zmax),
+    ]
+    edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ]
+    return verts, edges
+
+
+def add_wire_box(name: str, bbox, mat: bpy.types.Material, coll: bpy.types.Collection) -> bpy.types.Object:
+    verts, edges = bbox_vertices_and_edges(bbox)
+    mesh = bpy.data.meshes.new(name + "_mesh")
+    mesh.from_pydata(verts, edges, [])
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    coll.objects.link(obj)
+    obj.data.materials.append(mat)
+    obj.display_type = "WIRE"
+    obj.show_in_front = True
+    return obj
+
+
+def vent_corners_from_bbox(bbox):
+    xmin, xmax, ymin, ymax, zmin, zmax = [float(x) for x in bbox]
+    dx = abs(xmax - xmin)
+    dy = abs(ymax - ymin)
+    dz = abs(zmax - zmin)
+    eps = 1.0e-8
+
+    if dz <= max(dx, dy, eps) * 1.0e-6:
+        z = 0.5 * (zmin + zmax)
+        return [(xmin, ymin, z), (xmax, ymin, z), (xmax, ymax, z), (xmin, ymax, z)]
+    if dy <= max(dx, dz, eps) * 1.0e-6:
+        y = 0.5 * (ymin + ymax)
+        return [(xmin, y, zmin), (xmax, y, zmin), (xmax, y, zmax), (xmin, y, zmax)]
+    if dx <= max(dy, dz, eps) * 1.0e-6:
+        x = 0.5 * (xmin + xmax)
+        return [(x, ymin, zmin), (x, ymax, zmin), (x, ymax, zmax), (x, ymin, zmax)]
+
+    # Fallback: draw the bottom face.
+    return [(xmin, ymin, zmin), (xmax, ymin, zmin), (xmax, ymax, zmin), (xmin, ymax, zmin)]
+
+
+def add_rect_vent(name: str, bbox, mat: bpy.types.Material, coll: bpy.types.Collection) -> bpy.types.Object:
+    verts = vent_corners_from_bbox(bbox)
+    mesh = bpy.data.meshes.new(name + "_mesh")
+    mesh.from_pydata(verts, [], [(0, 1, 2, 3)])
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    coll.objects.link(obj)
+    obj.data.materials.append(mat)
+    obj.show_transparent = True
+    return obj
+
+
+def surface_lookup(scene: dict) -> dict[int, dict]:
+    out = {}
+    for sf in scene.get("surfaces", []):
+        try:
+            out[int(sf.get("surface_index", -999))] = sf
+        except Exception:
+            pass
+    return out
+
+
+def vent_color(vent: dict, surfaces: dict[int, dict]):
+    if vent.get("has_rgb"):
+        return vent.get("rgb", [0.7, 0.7, 0.7]), vent.get("transparency", 1.0)
+    sf = surfaces.get(int(vent.get("surf_index", -999)))
+    if sf:
+        return sf.get("rgb", [0.7, 0.7, 0.7]), sf.get("transparency", 1.0)
+    return [0.7, 0.7, 0.7], 1.0
+
+
+def load_bsmv_scene(geom_dir: str | Path) -> list[bpy.types.Object]:
+    geom_dir = abs_path(geom_dir)
+    scene_path = geom_dir / "scene_manifest.json"
+    if not scene_path.exists():
+        print(f"[scene] no scene_manifest.json found at {scene_path}")
+        return []
+
+    scene = read_json(scene_path)
+    coll = get_or_create_collection("bsmv_scene")
+    objects: list[bpy.types.Object] = []
+
+    if BLENDER_DRAW_DOMAIN_BOX and scene.get("domain_bbox"):
+        objects.append(add_wire_box("bsmv_domain_bbox", scene["domain_bbox"], domain_material(), coll))
+
+    if BLENDER_DRAW_MESH_BOXES:
+        mat = mesh_box_material()
+        for mesh_info in scene.get("meshes", []):
+            mid = int(mesh_info.get("mesh_index_1based", 0))
+            bbox = mesh_info.get("bbox")
+            if bbox:
+                objects.append(add_wire_box(f"bsmv_mesh_{mid:04d}_bbox", bbox, mat, coll))
+
+    if BLENDER_DRAW_VENTS:
+        surfaces = surface_lookup(scene)
+        vent_coll = get_or_create_collection("bsmv_vents")
+        for n, vent in enumerate(scene.get("vents", []), start=1):
+            if vent.get("circular"):
+                # Rectangular vents are enough for the first visible pass.
+                continue
+            if not vent.get("has_bbox"):
+                continue
+            rgb, alpha = vent_color(vent, surfaces)
+            mat = vent_material(rgb, alpha, f"{n:04d}")
+            mid = int(vent.get("mesh_index_1based", 0))
+            vid = int(vent.get("vent_index_1based", n))
+            objects.append(add_rect_vent(f"bsmv_vent_m{mid:04d}_{vid:04d}", vent["bbox"], mat, vent_coll))
+
+    print(
+        f"[scene] loaded scene manifest: "
+        f"{len(scene.get('meshes', []))} mesh boxes available, "
+        f"{len(scene.get('surfaces', []))} surfaces, "
+        f"{len(scene.get('vents', []))} vents"
+    )
+    return objects
+
+
+# -----------------------------------------------------------------------------
+# VDB loading. This is intentionally conservative; existing VDB material tweaks
+# can be layered on top later.
+# -----------------------------------------------------------------------------
+
+def find_mesh_manifests(vdb_dir: Path, chid: str) -> list[Path]:
+    out = sorted(vdb_dir.glob(f"{chid}_mesh_*_manifest.json"))
+    if not out:
+        out = sorted(vdb_dir.glob("*_mesh_*_manifest.json"))
+    return out
+
+
+def import_vdb(filepath: Path) -> bpy.types.Object | None:
+    before = set(bpy.data.objects.keys())
+    if not hasattr(bpy.ops.object, "volume_import"):
+        raise RuntimeError("Blender does not have bpy.ops.object.volume_import; cannot import VDB.")
+    bpy.ops.object.volume_import(filepath=str(filepath))
+    after = set(bpy.data.objects.keys())
+    new_names = sorted(after - before)
+    if not new_names:
+        return None
+    return bpy.data.objects[new_names[-1]]
+
+
+def import_bsmv_vdb_sequence(vdb_dir: str | Path, chid: str) -> list[bpy.types.Object]:
+    vdb_dir = abs_path(vdb_dir)
+    if not vdb_dir.exists():
+        print(f"[vdb] directory does not exist: {vdb_dir}")
+        return []
+
+    manifests = find_mesh_manifests(vdb_dir, chid)
+    if BLENDER_MAX_MESHES is not None:
+        manifests = manifests[: int(BLENDER_MAX_MESHES)]
+    if not manifests:
+        print(f"[vdb] no mesh manifests found in {vdb_dir}")
+        return []
+
+    coll = get_or_create_collection("bsmv_vdb_volumes")
+    loaded: list[bpy.types.Object] = []
+    print(f"[vdb] loading {len(manifests)} mesh manifest(s) from {vdb_dir}")
+
+    for m_index, manifest_path in enumerate(manifests):
+        manifest = read_json(manifest_path)
+        frames = manifest.get("frames", [])
+        if not frames:
+            continue
+        first_vdb = vdb_dir / frames[0].get("filename", "")
+        if not first_vdb.exists():
+            print(f"[vdb] WARNING: missing {first_vdb}")
             continue
 
-         m_id = re.search(r"\bID\s*=\s*'([^']+)'", rec, re.I | re.S)
-         m_surf = re.search(r"\bSURF_ID\s*=\s*'([^']+)'", rec, re.I | re.S)
-         m_xyz = re.search(r"\bXYZ\s*=\s*([^/]+?)(?=\s+\b[A-Z_]+\s*=|$)", rec, re.I | re.S)
-         m_xb  = re.search(r"\bXB\s*=\s*([^/]+?)(?=\s+\b[A-Z_]+\s*=|$)", rec, re.I | re.S)
-
-         center = (0.0, 0.0, 0.0)
-         xb = None
-
-         if m_xyz is not None:
-            xyz_vals = _parse_float_list(m_xyz.group(1))
-            if len(xyz_vals) >= 3:
-               center = (xyz_vals[0], xyz_vals[1], xyz_vals[2])
-
-         if m_xb is not None:
-            xb_vals = _parse_float_list(m_xb.group(1))
-            if len(xb_vals) >= 6:
-               xb = tuple(xb_vals[:6])
-
-         data["circular_vents"].append({
-            "id": m_id.group(1).strip() if m_id else None,
-            "surface_name": m_surf.group(1).strip() if m_surf else None,
-            "center": center,
-            "radius": float(m_radius.group(1)),
-            "xb": xb,
-         })
-
-   return data
-
-# -----------------------------------------------------------------------------
-# SMV parsing
-# -----------------------------------------------------------------------------
-
-def parse_smv(path: Path, fds_info: Optional[dict] = None) -> dict:
-   lines = path.read_text().splitlines()
-   i = 0
-
-   data = {
-      "chid": path.stem,
-      "surfdef": "INERT",
-      "surface_order": [],
-      "surface_rgba": {},
-      "outline_segments": [],
-      "obsts": [],
-      "vents": [],
-      "cvents": [],
-      "ventorig": [],
-      "pdim": None,
-   }
-
-   while i < len(lines):
-      i = _next_nonempty(lines, i)
-      if i >= len(lines):
-         break
-
-      key = lines[i].strip()
-
-      if key == "CHID":
-         i = _next_nonempty(lines, i + 1)
-         data["chid"] = lines[i].strip()
-         i += 1
-         continue
-
-      if key == "SURFDEF":
-         i = _next_nonempty(lines, i + 1)
-         data["surfdef"] = lines[i].strip()
-         i += 1
-         continue
-
-      if key == "SURFACE":
-         i = _next_nonempty(lines, i + 1)
-         name = lines[i].strip()
-         data["surface_order"].append(name)
-
-         i = _next_nonempty(lines, i + 1)
-         i = _next_nonempty(lines, i + 1)
-         rgba_line = lines[i].split('!')[0].strip()
-         rgba_vals = _parse_float_list(rgba_line)
-
-         if len(rgba_vals) >= 7:
-            # Use the final RGB triplet written by Smokeview.
-            data["surface_rgba"][name] = (rgba_vals[4], rgba_vals[5], rgba_vals[6], 1.0)
-         elif len(rgba_vals) >= 4:
-            data["surface_rgba"][name] = (rgba_vals[-3], rgba_vals[-2], rgba_vals[-1], 1.0)
-
-         i = _next_nonempty(lines, i + 1)
-         i += 1
-         continue
-
-      if key == "OUTLINE":
-         i = _next_nonempty(lines, i + 1)
-         nseg = int(lines[i].split()[0])
-         i += 1
-         for _ in range(nseg):
-            vals = [float(x) for x in lines[i].split()[:6]]
-            data["outline_segments"].append(tuple(vals))
-            i += 1
-         continue
-
-      if key == "VENTORIG":
-         i = _next_nonempty(lines, i + 1)
-         nvent = int(lines[i].split()[0])
-         i += 1
-         for iv in range(nvent):
-            raw = lines[i].split('!')[0]
-            vals = _parse_float_list(raw)
-            if len(vals) >= 6:
-               data["ventorig"].append({
-                  "name": f"VENTORIG_{iv+1:04d}",
-                  "xb": tuple(vals[:6]),
-               })
-            i += 1
-         continue
-
-      if key == "PDIM":
-         i = _next_nonempty(lines, i + 1)
-         vals = [float(x) for x in lines[i].split()[:6]]
-         data["pdim"] = tuple(vals)
-         i += 1
-         continue
-
-      if key == "OBST":
-         i = _next_nonempty(lines, i + 1)
-         nobst = int(lines[i].split()[0])
-         i += 1
-         for iob in range(nobst):
-            vals = lines[i].split()
-            xb = tuple(float(x) for x in vals[:6])
-            data["obsts"].append({
-               "name": f"OBST_{iob+1:04d}",
-               "xb": xb,
-            })
-            i += 1
-            i += 1
-         continue
-
-      if key == "VENT":
-         i = _next_nonempty(lines, i + 1)
-         nvent = int(lines[i].split()[0])
-         i += 1
-         vent_defs = []
-         for iv in range(nvent):
-            vals = lines[i].split()
-            xb = tuple(float(x) for x in vals[:6])
-            surface_index = 0
-            if len(vals) >= 8:
-               surface_index = int(vals[7])
-            vent_defs.append({
-               "name": f"VENT_{iv+1:04d}",
-               "xb": xb,
-               "surface_index": surface_index,
-            })
-            i += 1
-         i += nvent
-         data["vents"].extend(vent_defs)
-         continue
-
-      if key == "CVENT":
-         i = _next_nonempty(lines, i + 1)
-         ncvent = int(lines[i].split()[0])
-         i += 1
-
-         cvent_defs = []
-         for iv in range(ncvent):
-            raw = lines[i].rstrip()
-            left = raw.split('%')[0]
-            vals = left.split()
-
-            xb = tuple(float(x) for x in vals[:6])
-            surface_index = 0
-            if len(vals) >= 8:
-               surface_index = int(vals[7])
-
-            center = None
-            radius = None
-            if '%' in raw:
-               rhs = raw.split('%', 1)[1]
-               rhs_vals = _parse_float_list(rhs)
-               if len(rhs_vals) >= 4:
-                  center = (rhs_vals[0], rhs_vals[1], rhs_vals[2])
-                  radius = rhs_vals[3]
-
-            cvent_defs.append({
-               "name": f"CVENT_{iv+1:04d}",
-               "xb": xb,
-               "surface_index": surface_index,
-               "center": center,
-               "radius": radius,
-            })
-            i += 1
-
-         i += ncvent
-         data["cvents"].extend(cvent_defs)
-         continue
-
-      i += 1
-
-   surface_index_lookup = {0: data["surfdef"]}
-   next_index = 1
-   for name in data["surface_order"]:
-      if name == data["surfdef"]:
-         continue
-      surface_index_lookup[next_index] = name
-      next_index += 1
-   data["surface_index_lookup"] = surface_index_lookup
-
-   for vent in data["vents"]:
-      vent["surface_name"] = surface_index_lookup.get(vent["surface_index"], data["surfdef"])
-
-   for cvent in data["cvents"]:
-      cvent["surface_name"] = surface_index_lookup.get(cvent["surface_index"], data["surfdef"])
-
-   data["surface_color_names"] = {}
-   if fds_info is not None:
-      data["surface_color_names"] = dict(fds_info.get("surface_color_names", {}))
-
-   data["circular_vents"] = consolidate_cvents(data["cvents"], fds_info=fds_info)
-   return data
-
-
-def _cvent_plane_axis(xb: Tuple[float, float, float, float, float, float]) -> Tuple[str, float]:
-   x1, x2, y1, y2, z1, z2 = xb
-   if abs(x2 - x1) < EPS:
-      return "x", x1
-   if abs(y2 - y1) < EPS:
-      return "y", y1
-   if abs(z2 - z1) < EPS:
-      return "z", z1
-   raise ValueError(f"CVENT is not planar: {xb}")
-
-
-def consolidate_cvents(cvents: List[dict], fds_info: Optional[dict] = None) -> List[dict]:
-   grouped: Dict[Tuple, dict] = {}
-
-   for cv in cvents:
-      if cv.get("center") is None or cv.get("radius") is None:
-         continue
-
-      axis, plane_value = _cvent_plane_axis(cv["xb"])
-      key = (
-         cv["surface_name"],
-         axis,
-         round(plane_value, 6),
-         round(cv["center"][0], 6),
-         round(cv["center"][1], 6),
-         round(cv["center"][2], 6),
-         round(cv["radius"], 6),
-      )
-
-      if key not in grouped:
-         grouped[key] = {
-            "name": cv["name"],
-            "surface_name": cv["surface_name"],
-            "xb": cv["xb"],
-            "axis": axis,
-            "plane_value": plane_value,
-            "center": cv["center"],
-            "radius": cv["radius"],
-            "parts": 1,
-         }
-      else:
-         g = grouped[key]
-         g["parts"] += 1
-         x1, x2, y1, y2, z1, z2 = g["xb"]
-         a1, a2, b1, b2, c1, c2 = cv["xb"]
-         g["xb"] = (
-            min(x1, a1), max(x2, a2),
-            min(y1, b1), max(y2, b2),
-            min(z1, c1), max(z2, c2),
-         )
-
-   circles = list(grouped.values())
-
-   if fds_info is not None:
-      fds_circles = fds_info.get("circular_vents", [])
-      for cv in circles:
-         best = None
-         best_err = 1.0e99
-
-         for fv in fds_circles:
-            if fv.get("surface_name") not in (None, cv["surface_name"]):
-               continue
-            if fv.get("radius") is None:
-               continue
-
-            c0 = cv["center"]
-            c1 = fv["center"]
-            err = abs(cv["radius"] - fv["radius"])
-            err += abs(c0[0] - c1[0]) + abs(c0[1] - c1[1]) + abs(c0[2] - c1[2])
-
-            if err < best_err:
-               best_err = err
-               best = fv
-
-         if best is not None and best_err < 1.0e-4:
-            cv["fds_id"] = best.get("id")
-            if best.get("surface_name"):
-               cv["surface_name"] = best["surface_name"]
-            if best.get("xb") is not None:
-               cv["fds_xb"] = best["xb"]
-
-   circles.sort(key=lambda d: (d["surface_name"], d.get("fds_id") or d["name"]))
-   return circles
-
-# -----------------------------------------------------------------------------
-# Blender helpers
-# -----------------------------------------------------------------------------
-
-def clear_collection(name: str) -> bpy.types.Collection:
-   old = bpy.data.collections.get(name)
-   if old is not None:
-      objs = list(old.objects)
-      for obj in objs:
-         bpy.data.objects.remove(obj, do_unlink=True)
-      bpy.data.collections.remove(old)
-
-   coll = bpy.data.collections.new(name)
-   bpy.context.scene.collection.children.link(coll)
-   return coll
-
-
-def make_principled_material(name: str, color: Tuple[float, float, float, float], alpha: float = 1.0) -> bpy.types.Material:
-   mat = bpy.data.materials.get(name)
-   if mat is None:
-      mat = bpy.data.materials.new(name=name)
-
-   mat.use_nodes = True
-   nodes = mat.node_tree.nodes
-   links = mat.node_tree.links
-   for node in list(nodes):
-      nodes.remove(node)
-
-   out = nodes.new(type="ShaderNodeOutputMaterial")
-   bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
-   bsdf.inputs["Base Color"].default_value = color
-   bsdf.inputs["Roughness"].default_value = 0.6
-   bsdf.inputs["Alpha"].default_value = alpha
-   links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
-
-   if alpha < 0.999:
-      mat.blend_method = 'BLEND'
-      mat.use_transparent_shadow = False
-
-   return mat
-
-
-def make_emission_material(name: str, color: Tuple[float, float, float, float], strength: float = 1.0) -> bpy.types.Material:
-   mat = bpy.data.materials.get(name)
-   if mat is None:
-      mat = bpy.data.materials.new(name=name)
-
-   mat.use_nodes = True
-   nodes = mat.node_tree.nodes
-   links = mat.node_tree.links
-   for node in list(nodes):
-      nodes.remove(node)
-
-   out = nodes.new(type="ShaderNodeOutputMaterial")
-   emit = nodes.new(type="ShaderNodeEmission")
-   emit.inputs["Color"].default_value = color
-   emit.inputs["Strength"].default_value = strength
-   links.new(emit.outputs["Emission"], out.inputs["Surface"])
-   return mat
-
-
-def _rect_vertices(xb: Tuple[float, float, float, float, float, float], offset: float = 0.0) -> List[Tuple[float, float, float]]:
-   x1, x2, y1, y2, z1, z2 = xb
-
-   if abs(x2 - x1) < EPS:
-      x = x1 + offset
-      return [(x, y1, z1), (x, y2, z1), (x, y2, z2), (x, y1, z2)]
-
-   if abs(y2 - y1) < EPS:
-      y = y1 + offset
-      return [(x1, y, z1), (x2, y, z1), (x2, y, z2), (x1, y, z2)]
-
-   if abs(z2 - z1) < EPS:
-      z = z1 + offset
-      return [(x1, y1, z), (x2, y1, z), (x2, y2, z), (x1, y2, z)]
-
-   raise ValueError(f"VENT is not a plane: {xb}")
-
-
-def add_rect_face(name: str, xb: Tuple[float, float, float, float, float, float], mat: bpy.types.Material, coll: bpy.types.Collection, offset: float = 0.0, hide_render: bool = False):
-   verts = _rect_vertices(xb, offset=offset)
-   mesh = bpy.data.meshes.new(name + "_mesh")
-   mesh.from_pydata(verts, [], [(0, 1, 2, 3)])
-   mesh.update()
-
-   obj = bpy.data.objects.new(name, mesh)
-   obj.data.materials.append(mat)
-   coll.objects.link(obj)
-   obj.hide_render = bool(hide_render)
-   return obj
-
-
-def add_segment(name: str, p1: Tuple[float, float, float], p2: Tuple[float, float, float], mat: bpy.types.Material, coll: bpy.types.Collection, bevel: float = 0.005):
-   curve = bpy.data.curves.new(name + "_curve", type='CURVE')
-   curve.dimensions = '3D'
-   curve.bevel_depth = bevel
-   curve.bevel_resolution = 3
-
-   spline = curve.splines.new('POLY')
-   spline.points.add(1)
-   spline.points[0].co = (*p1, 1.0)
-   spline.points[1].co = (*p2, 1.0)
-
-   obj = bpy.data.objects.new(name, curve)
-   obj.data.materials.append(mat)
-   coll.objects.link(obj)
-   return obj
-
-
-def add_box(name: str, xb: Tuple[float, float, float, float, float, float], mat: bpy.types.Material, coll: bpy.types.Collection):
-   x1, x2, y1, y2, z1, z2 = xb
-   cx = 0.5*(x1 + x2)
-   cy = 0.5*(y1 + y2)
-   cz = 0.5*(z1 + z2)
-   sx = 0.5*(x2 - x1)
-   sy = 0.5*(y2 - y1)
-   sz = 0.5*(z2 - z1)
-
-   bpy.ops.mesh.primitive_cube_add(location=(cx, cy, cz))
-   obj = bpy.context.active_object
-   obj.name = name
-   obj.scale = (sx, sy, sz)
-   if len(obj.data.materials) == 0:
-      obj.data.materials.append(mat)
-   else:
-      obj.data.materials[0] = mat
-
-   for old in list(obj.users_collection):
-      old.objects.unlink(obj)
-   coll.objects.link(obj)
-   return obj
-
-
-def add_circle_face(name: str,
-                    axis: str,
-                    plane_value: float,
-                    center: Tuple[float, float, float],
-                    radius: float,
-                    mat: bpy.types.Material,
-                    coll: bpy.types.Collection,
-                    offset: float = 0.0,
-                    vertices: int = 128):
-   if axis == "x":
-      location = (plane_value + offset, center[1], center[2])
-      normal = Vector((1.0, 0.0, 0.0))
-   elif axis == "y":
-      location = (center[0], plane_value + offset, center[2])
-      normal = Vector((0.0, 1.0, 0.0))
-   elif axis == "z":
-      location = (center[0], center[1], plane_value + offset)
-      normal = Vector((0.0, 0.0, 1.0))
-   else:
-      raise ValueError(f"Unknown circle axis: {axis}")
-
-   bpy.ops.mesh.primitive_circle_add(vertices=vertices, radius=radius, fill_type='NGON', location=location)
-   obj = bpy.context.active_object
-   obj.name = name
-   obj.rotation_euler = Vector((0.0, 0.0, 1.0)).rotation_difference(normal).to_euler()
-
-   if len(obj.data.materials) == 0:
-      obj.data.materials.append(mat)
-   else:
-      obj.data.materials[0] = mat
-
-   for old in list(obj.users_collection):
-      old.objects.unlink(obj)
-   coll.objects.link(obj)
-   return obj
-
-
-def look_at(obj: bpy.types.Object, target: Vector):
-   direction = target - obj.location
-   quat = direction.to_track_quat('-Z', 'Y')
-   obj.rotation_euler = quat.to_euler()
-
-
-def setup_camera_and_light(data: dict, coll: bpy.types.Collection):
-   if data["pdim"] is None:
-      return
-
-   x1, x2, y1, y2, z1, z2 = data["pdim"]
-   cx = 0.5*(x1 + x2)
-   cy = 0.5*(y1 + y2)
-   cz = 0.5*(z1 + z2)
-   lx = x2 - x1
-   ly = y2 - y1
-   lz = z2 - z1
-
-   cam_data = bpy.data.cameras.new(data["chid"] + "_cam")
-   cam = bpy.data.objects.new(data["chid"] + "_cam", cam_data)
-   cam.location = (cx, y1 - 1.7*max(lx, ly), z1 + 0.52*lz)
-   cam.data.lens = 35.0
-   coll.objects.link(cam)
-   look_at(cam, Vector((cx, cy, cz)))
-   bpy.context.scene.camera = cam
-
-   light_data = bpy.data.lights.new(data["chid"] + "_sun", type='SUN')
-   light_data.energy = 2.0
-   sun = bpy.data.objects.new(data["chid"] + "_sun", light_data)
-   sun.location = (cx - 2.0*lx, y1 - 0.5*ly, z2 + 2.0*lz)
-   sun.rotation_euler = (math.radians(35.0), 0.0, math.radians(-20.0))
-   coll.objects.link(sun)
-
-
-def _touch_or_overlap(a1, a2, b1, b2, eps=1.0e-9):
-   return not (a2 < b1 - eps or b2 < a1 - eps)
-
-
-def _same(a, b, eps=1.0e-9):
-   return abs(a - b) < eps
-
-
-def _merge_two_open_xb(xb1, xb2, eps=1.0e-9):
-   x1a, x2a, y1a, y2a, z1a, z2a = xb1
-   x1b, x2b, y1b, y2b, z1b, z2b = xb2
-
-   if _same(x1a, x2a, eps) and _same(x1b, x2b, eps) and _same(x1a, x1b, eps):
-      same_y = _same(y1a, y1b, eps) and _same(y2a, y2b, eps)
-      same_z = _same(z1a, z1b, eps) and _same(z2a, z2b, eps)
-
-      if same_y and _touch_or_overlap(z1a, z2a, z1b, z2b, eps):
-         return (x1a, x2a, y1a, y2a, min(z1a, z1b), max(z2a, z2b))
-      if same_z and _touch_or_overlap(y1a, y2a, y1b, y2b, eps):
-         return (x1a, x2a, min(y1a, y1b), max(y2a, y2b), z1a, z2a)
-
-   if _same(y1a, y2a, eps) and _same(y1b, y2b, eps) and _same(y1a, y1b, eps):
-      same_x = _same(x1a, x1b, eps) and _same(x2a, x2b, eps)
-      same_z = _same(z1a, z1b, eps) and _same(z2a, z2b, eps)
-
-      if same_x and _touch_or_overlap(z1a, z2a, z1b, z2b, eps):
-         return (x1a, x2a, y1a, y2a, min(z1a, z1b), max(z2a, z2b))
-      if same_z and _touch_or_overlap(x1a, x2a, x1b, x2b, eps):
-         return (min(x1a, x1b), max(x2a, x2b), y1a, y2a, z1a, z2a)
-
-   if _same(z1a, z2a, eps) and _same(z1b, z2b, eps) and _same(z1a, z1b, eps):
-      same_x = _same(x1a, x1b, eps) and _same(x2a, x2b, eps)
-      same_y = _same(y1a, y1b, eps) and _same(y2a, y2b, eps)
-
-      if same_x and _touch_or_overlap(y1a, y2a, y1b, y2b, eps):
-         return (x1a, x2a, min(y1a, y1b), max(y2a, y2b), z1a, z2a)
-      if same_y and _touch_or_overlap(x1a, x2a, x1b, x2b, eps):
-         return (min(x1a, x1b), max(x2a, x2b), y1a, y2a, z1a, z2a)
-
-   return None
-
-
-def coalesce_open_vents(vents: List[dict]) -> List[dict]:
-   open_vents = [dict(v) for v in vents if v["surface_name"].upper() == "OPEN"]
-   changed = True
-   while changed:
-      changed = False
-      merged = []
-      used = [False] * len(open_vents)
-
-      for i in range(len(open_vents)):
-         if used[i]:
+        obj_name = sanitize_name(str(manifest.get("mesh_id", manifest_path.stem.replace("_manifest", ""))))
+        if BLENDER_SKIP_EXISTING_VDB and bpy.data.objects.get(obj_name):
+            loaded.append(bpy.data.objects[obj_name])
             continue
-         xb = open_vents[i]["xb"]
 
-         for j in range(i + 1, len(open_vents)):
-            if used[j]:
-               continue
-            xb_new = _merge_two_open_xb(xb, open_vents[j]["xb"])
-            if xb_new is not None:
-               xb = xb_new
-               used[j] = True
-               changed = True
+        obj = import_vdb(first_vdb)
+        if obj is None:
+            continue
+        obj.name = obj_name
+        obj.data.name = obj_name + "_volume"
+        move_object_to_collection(obj, coll)
 
-         used[i] = True
-         vv = dict(open_vents[i])
-         vv["xb"] = xb
-         merged.append(vv)
+        origin = manifest.get("origin", [0.0, 0.0, 0.0])
+        spacing = manifest.get("spacing", [1.0, 1.0, 1.0])
+        obj.location = (float(origin[0]), float(origin[1]), float(origin[2]))
+        obj.scale = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
 
-      open_vents = merged
+        if BLENDER_VISIBLE_COUNT is not None and m_index >= int(BLENDER_VISIBLE_COUNT):
+            obj.hide_viewport = True
+            obj.hide_render = True
 
-   return open_vents
+        loaded.append(obj)
+        print(f"[vdb] loaded {obj.name}")
 
+    return loaded
 
-def add_rect_frame(name: str, xb, mat, coll, width: float = 0.01, offset: float = 0.001, hide_render: bool = False):
-   x1, x2, y1, y2, z1, z2 = xb
-
-   if abs(x2 - x1) < EPS:
-      x = x1 + offset
-      w = min(width, 0.49*(y2-y1), 0.49*(z2-z1))
-      add_rect_face(name+"_left",   (x, x, y1, y1+w, z1, z2), mat, coll, hide_render=hide_render)
-      add_rect_face(name+"_right",  (x, x, y2-w, y2, z1, z2), mat, coll, hide_render=hide_render)
-      add_rect_face(name+"_bottom", (x, x, y1+w, y2-w, z1, z1+w), mat, coll, hide_render=hide_render)
-      add_rect_face(name+"_top",    (x, x, y1+w, y2-w, z2-w, z2), mat, coll, hide_render=hide_render)
-      return
-
-   if abs(y2 - y1) < EPS:
-      y = y1 + offset
-      w = min(width, 0.49*(x2-x1), 0.49*(z2-z1))
-      add_rect_face(name+"_left",   (x1, x1+w, y, y, z1, z2), mat, coll, hide_render=hide_render)
-      add_rect_face(name+"_right",  (x2-w, x2, y, y, z1, z2), mat, coll, hide_render=hide_render)
-      add_rect_face(name+"_bottom", (x1+w, x2-w, y, y, z1, z1+w), mat, coll, hide_render=hide_render)
-      add_rect_face(name+"_top",    (x1+w, x2-w, y, y, z2-w, z2), mat, coll, hide_render=hide_render)
-      return
-
-   if abs(z2 - z1) < EPS:
-      z = z1 + offset
-      w = min(width, 0.49*(x2-x1), 0.49*(y2-y1))
-      add_rect_face(name+"_left",   (x1, x1+w, y1, y2, z, z), mat, coll, hide_render=hide_render)
-      add_rect_face(name+"_right",  (x2-w, x2, y1, y2, z, z), mat, coll, hide_render=hide_render)
-      add_rect_face(name+"_bottom", (x1+w, x2-w, y1, y1+w, z, z), mat, coll, hide_render=hide_render)
-      add_rect_face(name+"_top",    (x1+w, x2-w, y2-w, y2, z, z), mat, coll, hide_render=hide_render)
-      return
-
-   raise ValueError(f"OPEN vent is not planar: {xb}")
 
 # -----------------------------------------------------------------------------
-# Build scene
+# View helpers
 # -----------------------------------------------------------------------------
 
-def build_scene(data: dict, make_open_outline: bool = True, make_room_outline: bool = True):
-   coll = clear_collection(data["chid"] + "_SMV")
+def compute_scene_bbox(objects: list[bpy.types.Object]):
+    pts = []
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    for obj in objects:
+        try:
+            eval_obj = obj.evaluated_get(depsgraph)
+            for corner in eval_obj.bound_box:
+                pts.append(eval_obj.matrix_world @ Vector(corner))
+        except Exception:
+            pass
+    if not pts:
+        return None
+    mn = (min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts))
+    mx = (max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts))
+    return mn, mx
 
-   mats: Dict[str, bpy.types.Material] = {}
-   surface_names = {data["surfdef"]}
-   surface_names |= {v["surface_name"] for v in data["vents"]}
-   surface_names |= {v["surface_name"] for v in data["circular_vents"]}
 
-   for sname in surface_names:
-      rgba = choose_surface_color(
-         sname,
-         surface_color_name=data.get("surface_color_names", {}).get(sname),
-         surface_rgba=data.get("surface_rgba", {}).get(sname),
-      )
-      mats[sname] = make_principled_material("MAT_" + sname.replace(" ", "_"), rgba, alpha=rgba[3])
+def add_basic_camera_and_light(objects: list[bpy.types.Object]) -> None:
+    if not BLENDER_ADD_BASIC_CAMERA_AND_LIGHT:
+        return
+    bbox = compute_scene_bbox(objects)
+    if bbox is None:
+        return
 
-   outline_mat = make_emission_material("MAT_OUTLINE_BLACK", (0.0, 0.0, 0.0, 1.0), strength=1.0)
-   open_mat = make_principled_material("MAT_OPEN_MAGENTA", (1.0, 0.0, 1.0, 1.0), alpha=1.0)
+    mn, mx = bbox
+    cx = 0.5 * (mn[0] + mx[0])
+    cy = 0.5 * (mn[1] + mx[1])
+    cz = 0.5 * (mn[2] + mx[2])
+    radius = max(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2], 1.0)
 
-   obst_mat = mats.get(
-      data["surfdef"],
-      make_principled_material("MAT_OBST", choose_surface_color(data["surfdef"]))
-   )
+    if bpy.data.objects.get("bsmv_camera") is None:
+        bpy.ops.object.camera_add(
+            location=(cx - 1.7 * radius, cy - 2.4 * radius, cz + 1.2 * radius),
+            rotation=(math.radians(62.0), 0.0, math.radians(-35.0)),
+        )
+        cam = bpy.context.object
+        cam.name = "bsmv_camera"
+        bpy.context.scene.camera = cam
+    else:
+        cam = bpy.data.objects["bsmv_camera"]
 
-   for obst in data["obsts"]:
-      add_box(obst["name"], obst["xb"], obst_mat, coll)
+    if BLENDER_SET_CLIP_DISTANCES and cam.type == "CAMERA":
+        cam.data.clip_start = 0.01
+        cam.data.clip_end = max(100000.0, 10.0 * radius)
 
-   non_open_vents = [v for v in data["vents"] if v["surface_name"].upper() != "OPEN"]
-   open_vents = coalesce_open_vents(data["vents"])
+    if bpy.data.objects.get("bsmv_sun") is None:
+        bpy.ops.object.light_add(type="SUN", location=(cx, cy, cz + radius))
+        sun = bpy.context.object
+        sun.name = "bsmv_sun"
+        sun.data.energy = 2.0
 
-   if not BLENDER_SHOW_MESH_SEAMS:
-      merged = []
-      by_surface: Dict[str, List[dict]] = {}
-      for v in non_open_vents:
-         by_surface.setdefault(v["surface_name"], []).append(dict(v))
-
-      for sname, group in by_surface.items():
-         changed = True
-         while changed:
-            changed = False
-            new_group = []
-            used = [False] * len(group)
-
-            for i in range(len(group)):
-               if used[i]:
-                  continue
-               xb = group[i]["xb"]
-
-               for j in range(i + 1, len(group)):
-                  if used[j]:
-                     continue
-                  xb_new = _merge_two_open_xb(xb, group[j]["xb"])
-                  if xb_new is not None:
-                     xb = xb_new
-                     used[j] = True
-                     changed = True
-
-               used[i] = True
-               vv = dict(group[i])
-               vv["xb"] = xb
-               new_group.append(vv)
-
-            group = new_group
-
-         merged.extend(group)
-
-      non_open_vents = merged
-
-   for iv, vent in enumerate(non_open_vents, start=1):
-      sname = vent["surface_name"]
-      xb = vent["xb"]
-      name = f"{sname}_{iv:04d}"
-
-      offset = 0.0
-      if "BURNER" in sname.upper():
-         offset = 0.001
-
-      add_rect_face(name, xb, mats[sname], coll, offset=offset)
-
-   for iv, cvent in enumerate(data["circular_vents"], start=1):
-      sname = cvent["surface_name"]
-      name_root = cvent.get("fds_id") or sname
-      name = f"{name_root}_{iv:04d}"
-
-      offset = 0.0
-      if cvent["axis"] == "z":
-         if sname.upper() == "LNG_POOL":
-            offset = 2.0e-4
-         elif sname.upper() == "WATER_POOL":
-            offset = 1.0e-4
-
-      add_circle_face(
-         name=name,
-         axis=cvent["axis"],
-         plane_value=cvent["plane_value"],
-         center=cvent["center"],
-         radius=cvent["radius"],
-         mat=mats[sname],
-         coll=coll,
-         offset=offset,
-         vertices=BLENDER_CIRCLE_VERTS,
-      )
-
-   if make_open_outline:
-      open_fill_mat = None
-      if BLENDER_SHOW_OPEN_FACE:
-         open_fill_mat = make_principled_material("MAT_OPEN_FILL", (1.0, 0.0, 1.0, 0.08), alpha=0.08)
-
-      for iv, vent in enumerate(open_vents, start=1):
-         xb = vent["xb"]
-         name = f"OPEN_{iv:04d}"
-
-         if BLENDER_SHOW_OPEN_FACE:
-            add_rect_face(name + "_fill", xb, open_fill_mat, coll, offset=0.001, hide_render=not BLENDER_OPEN_IN_RENDER)
-
-         add_rect_frame(
-            name + "_outline",
-            xb,
-            open_mat,
-            coll,
-            width=BLENDER_OPEN_FRAME_WIDTH,
-            offset=0.001,
-            hide_render=not BLENDER_OPEN_IN_RENDER
-         )
-
-   if make_room_outline:
-      for iseg, seg in enumerate(data["outline_segments"], start=1):
-         p1 = (seg[0], seg[1], seg[2])
-         p2 = (seg[3], seg[4], seg[5])
-         add_segment(f"OUTLINE_{iseg:04d}", p1, p2, outline_mat, coll, bevel=0.004)
-
-   setup_camera_and_light(data, coll)
-   bpy.context.scene.render.engine = 'BLENDER_EEVEE'
-
-   print(f"Built scene for CHID = {data['chid']}")
-   print(f"  OBST count       = {len(data['obsts'])}")
-   print(f"  VENT count       = {len(data['vents'])}")
-   print(f"  OPEN merged      = {len(open_vents)}")
-   print(f"  CVENT pieces     = {len(data['cvents'])}")
-   print(f"  CVENT circles    = {len(data['circular_vents'])}")
-   for cv in data["circular_vents"]:
-      print(f"    {cv.get('fds_id') or cv['surface_name']}: center={cv['center']} radius={cv['radius']} plane={cv['axis']}={cv['plane_value']}")
-   print(f"  SURFDEF          = {data['surfdef']}")
-   print(f"  Surfaces         = {data['surface_index_lookup']}")
 
 # -----------------------------------------------------------------------------
-# Path resolution
+# Main
 # -----------------------------------------------------------------------------
 
-def resolve_smv_path(chid: str, smv: Optional[str] = None, smv_dir: Optional[str] = None) -> Path:
-   if smv is not None:
-      return Path(smv).expanduser().resolve()
+def run() -> None:
+    if BLENDER_CLEAR_SCENE:
+        clear_scene()
 
-   search_dirs: List[Path] = []
+    loaded_objects: list[bpy.types.Object] = []
 
-   if smv_dir is not None:
-      search_dirs.append(Path(smv_dir).expanduser().resolve())
+    if BLENDER_LOAD_GEOM:
+        loaded_objects.extend(import_bsmv_geometry(BLENDER_GEOM_DIR, BLENDER_CHID))
 
-   script_path = get_text_editor_script_path()
-   if script_path is not None:
-      search_dirs.append(script_path.parent)
-      search_dirs.append(script_path.parent / "Simple_Test")
+    if BLENDER_LOAD_SCENE:
+        loaded_objects.extend(load_bsmv_scene(BLENDER_GEOM_DIR))
 
-   search_dirs.append(Path.cwd())
-   search_dirs.append(Path.cwd() / "Simple_Test")
+    # Force Blender to show geometry/scene before starting heavy VDB imports.
+    bpy.context.view_layer.update()
+    print("[geom/scene] loaded; starting VDB load" if BLENDER_LOAD_VDB else "[geom/scene] loaded; VDB load is off")
 
-   seen = set()
-   for d in search_dirs:
-      try:
-         rd = d.resolve()
-      except Exception:
-         continue
-      key = str(rd)
-      if key in seen:
-         continue
-      seen.add(key)
-      candidate = rd / f"{chid}.smv"
-      if candidate.exists():
-         return candidate
+    if BLENDER_LOAD_VDB:
+        loaded_objects.extend(import_bsmv_vdb_sequence(BLENDER_VDB_DIR, BLENDER_CHID))
 
-   if search_dirs:
-      try:
-         return search_dirs[0].resolve() / f"{chid}.smv"
-      except Exception:
-         pass
-   return Path.cwd() / f"{chid}.smv"
+    add_basic_camera_and_light(loaded_objects)
+
+    print(
+        "[done] loaded "
+        f"{len([o for o in loaded_objects if o.type == 'MESH'])} mesh object(s), "
+        f"{len([o for o in loaded_objects if o.type == 'VOLUME'])} volume object(s)"
+    )
 
 
-def resolve_fds_path(smv_path: Path) -> Path:
-   return smv_path.with_suffix(".fds")
-
-# -----------------------------------------------------------------------------
-# Run
-# -----------------------------------------------------------------------------
-
-def run(chid: str = "simple_test",
-        smv: Optional[str] = None,
-        smv_dir: Optional[str] = None,
-        make_open_outline: bool = True,
-        make_room_outline: bool = True):
-   smv_path = resolve_smv_path(chid=chid, smv=smv, smv_dir=smv_dir)
-   if not smv_path.exists():
-      print(f"Current working directory: {Path.cwd()}")
-      print(f"Text editor script path: {get_text_editor_script_path()}")
-      raise FileNotFoundError(f"Could not find SMV file: {smv_path}")
-
-   fds_info = None
-   fds_path = resolve_fds_path(smv_path)
-   if fds_path.exists():
-      fds_info = parse_fds(fds_path)
-      print(f"Read FDS metadata from: {fds_path}")
-   else:
-      print(f"No sibling FDS file found at: {fds_path}")
-
-   data = parse_smv(smv_path, fds_info=fds_info)
-   build_scene(
-      data,
-      make_open_outline=make_open_outline,
-      make_room_outline=make_room_outline,
-   )
-
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
-
-def parse_args(argv: List[str]) -> argparse.Namespace:
-   if "--" in argv:
-      argv = argv[argv.index("--") + 1:]
-   else:
-      argv = []
-
-   parser = argparse.ArgumentParser()
-   parser.add_argument("--chid", default="simple_test", help="Case CHID; script looks for <chid>.smv unless --smv is given")
-   parser.add_argument("--smv", default=None, help="Explicit path to .smv file")
-   parser.add_argument("--smv-dir", default=None, help="Directory containing <chid>.smv")
-   parser.add_argument("--no-open-outline", action="store_true", help="Do not draw magenta outline around OPEN vents")
-   parser.add_argument("--no-room-outline", action="store_true", help="Do not draw black room outline from OUTLINE block")
-   return parser.parse_args(argv)
-
-
-def main(argv: Optional[List[str]] = None):
-   if argv is None:
-      argv = sys.argv
-
-   args = parse_args(argv)
-   run(
-      chid=args.chid,
-      smv=args.smv,
-      smv_dir=args.smv_dir,
-      make_open_outline=not args.no_open_outline,
-      make_room_outline=not args.no_room_outline,
-   )
-
-
-if __name__ == "__main__":
-   has_cli_args = "--" in sys.argv and len(sys.argv[sys.argv.index("--") + 1:]) > 0
-
-   if has_cli_args:
-      main(sys.argv)
-   elif BLENDER_AUTORUN:
-      run(
-         chid=BLENDER_CHID,
-         smv=BLENDER_SMV_PATH,
-         smv_dir=BLENDER_SMV_DIR,
-         make_open_outline=BLENDER_OPEN_OUTLINE,
-         make_room_outline=BLENDER_ROOM_OUTLINE,
-      )
+if BLENDER_AUTORUN:
+    run()

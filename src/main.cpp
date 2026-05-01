@@ -37,6 +37,7 @@ struct Args {
   fs::path smv_path;
   fs::path result_dir = ".";
   fs::path out_dir = "vdb_sequence";
+  fs::path geom_dir = "geometry";
   std::string temperature_quantity = "EFFECTIVE FLAME TEMPERATURE";
   std::string density_quantity = "SOOT DENSITY";
   std::optional<int> start;
@@ -74,6 +75,7 @@ Args parse_args(int argc, char **argv) {
     else if (a == "--smv") args.smv_path = need(a);
     else if (a == "--result-dir") args.result_dir = need(a);
     else if (a == "--out-dir") args.out_dir = need(a);
+    else if (a == "--geom-dir") args.geom_dir = need(a);
     else if (a == "--temperature-quantity") args.temperature_quantity = need(a);
     else if (a == "--density-quantity") args.density_quantity = need(a);
     else if (a == "--start") args.start = std::stoi(need(a));
@@ -89,7 +91,8 @@ Args parse_args(int argc, char **argv) {
       std::cout <<
         "Usage: bsmv --chid CHID --smv path/to/case.smv [options]\n"
         "  --result-dir DIR\n"
-        "  --out-dir DIR\n"
+        "  --out-dir DIR       Directory for VDB output, default vdb_sequence\n"
+        "  --geom-dir DIR      Directory for GEOM/OBJ output, default geometry\n"
         "  --temperature-quantity NAME\n"
         "  --density-quantity NAME\n"
         "  --start N\n"
@@ -184,8 +187,9 @@ bool write_geometry_from_smv(const Args &args, SharedState &shared, const bsmv::
     throw std::runtime_error("Found GE file but missing matching GE2 file: " + ge2_path.string());
   }
 
-  fs::path geom_dir = args.out_dir / "geometry";
-  fs::create_directories(geom_dir);
+  fs::create_directories(args.geom_dir);
+
+  status(args, shared, "[geom] writing OBJ files to: " + fs::absolute(args.geom_dir).string());
 
   status(args, shared, "[geom] reading GE : " + ge_path.string());
   status(args, shared, "[geom] reading GE2: " + ge2_path.string());
@@ -206,7 +210,7 @@ bool write_geometry_from_smv(const Args &args, SharedState &shared, const bsmv::
 
     const std::string obj_name =
         args.chid + "_geom_" + zero4(gm.geom_index_1based) + ".obj";
-    const fs::path obj_path = geom_dir / obj_name;
+    const fs::path obj_path = args.geom_dir / obj_name;
     bsmv::write_obj(obj_path, gm);
 
     bsmv::GeomOutputInfo info;
@@ -223,9 +227,13 @@ bool write_geometry_from_smv(const Args &args, SharedState &shared, const bsmv::
            " faces=" + std::to_string(info.n_faces));
   }
 
-  const fs::path manifest_path = geom_dir / "geometry_manifest.json";
+  const fs::path manifest_path = args.geom_dir / "geometry_manifest.json";
   bsmv::write_geometry_manifest(manifest_path, args.chid, ge_path, ge2_path, manifest_items);
   status(args, shared, "[geom] wrote " + manifest_path.string());
+
+  const fs::path scene_manifest_path = args.geom_dir / "scene_manifest.json";
+  bsmv::write_scene_manifest(scene_manifest_path, smv);
+  status(args, shared, "[scene] wrote " + scene_manifest_path.string());
 
   return true;
 }
@@ -409,8 +417,6 @@ int main(int argc, char **argv) {
 
     SharedState shared;
 
-    fs::create_directories(args.out_dir);
-
     status(args, shared, "Parsing SMV: " + args.smv_path.string());
     const bsmv::SmvData smv = bsmv::parse_smv_file(args.smv_path);
 
@@ -422,6 +428,8 @@ int main(int argc, char **argv) {
       status(args, shared, "Done with --geom-only.");
       return 0;
     }
+
+    fs::create_directories(args.out_dir);
 
     auto temp_by_mesh = bsmv::find_smokf3d_entries(smv, args.temperature_quantity);
     auto dens_by_mesh = bsmv::find_smokf3d_entries(smv, args.density_quantity);
