@@ -12,6 +12,7 @@ add_executable(bsmv
   src/smv_parser.cpp
   src/s3d_reader.cpp
   src/vdb_writer.cpp
+  src/geom_reader.cpp
 )
 
 target_include_directories(bsmv PRIVATE src)

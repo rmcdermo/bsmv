@@ -1,3 +1,4 @@
+#include "geom_reader.hpp"
 #include "s3d_reader.hpp"
 #include "smv_parser.hpp"
 #include "vdb_writer.hpp"
@@ -45,6 +46,8 @@ struct Args {
   int progress_every = 10;
   int threads = 1;
   bool quiet = false;
+  bool no_geom = false;
+  bool geom_only = false;
 };
 
 std::set<int> parse_mesh_ids(const std::string &text) {
@@ -80,6 +83,8 @@ Args parse_args(int argc, char **argv) {
     else if (a == "--progress-every") args.progress_every = std::max(1, std::stoi(need(a)));
     else if (a == "--threads") args.threads = std::max(1, std::stoi(need(a)));
     else if (a == "--quiet") args.quiet = true;
+    else if (a == "--no-geom") args.no_geom = true;
+    else if (a == "--geom-only") args.geom_only = true;
     else if (a == "--help" || a == "-h") {
       std::cout <<
         "Usage: bsmv --chid CHID --smv path/to/case.smv [options]\n"
@@ -93,6 +98,8 @@ Args parse_args(int argc, char **argv) {
         "  --mesh-ids 1,2,7\n"
         "  --progress-every N\n"
         "  --threads N\n"
+        "  --no-geom       Do not read/write GEOM OBJ files\n"
+        "  --geom-only     Write GEOM OBJ files, then stop before smoke/VDB conversion\n"
         "  --quiet\n";
       std::exit(0);
     } else {
@@ -132,6 +139,95 @@ std::string mesh_prefix(const std::string &tag, int mesh_id) {
   std::ostringstream oss;
   oss << "[" << tag << " mesh " << mesh_id << "] ";
   return oss.str();
+}
+
+fs::path first_existing_path(const std::vector<fs::path> &paths) {
+  for (const auto &p : paths) {
+    if (!p.empty() && fs::exists(p)) return p;
+  }
+  return {};
+}
+
+fs::path locate_ge_file(const Args &args, const bsmv::SmvData &smv) {
+  const fs::path smv_dir = args.smv_path.parent_path();
+  const std::string chid = !smv.chid.empty() ? smv.chid : args.chid;
+  std::vector<fs::path> candidates;
+
+  if (!smv.geom.ge_filename.empty()) {
+    const fs::path from_smv = smv.geom.ge_filename;
+    if (from_smv.is_absolute()) candidates.push_back(from_smv);
+    candidates.push_back(args.result_dir / from_smv.filename());
+    candidates.push_back(smv_dir / from_smv.filename());
+    candidates.push_back(from_smv);
+  }
+
+  candidates.push_back(args.result_dir / (chid + "_1.ge"));
+  candidates.push_back(smv_dir / (chid + "_1.ge"));
+
+  return first_existing_path(candidates);
+}
+
+bool write_geometry_from_smv(const Args &args, SharedState &shared, const bsmv::SmvData &smv) {
+  const fs::path ge_path = locate_ge_file(args, smv);
+  if (ge_path.empty()) {
+    if (smv.geom.n_geometry > 0 || args.geom_only) {
+      throw std::runtime_error("SMV references GEOM data, but could not find the .ge file. "
+                               "Looked beside --result-dir and beside the .smv file.");
+    }
+    status(args, shared, "[geom] no GEOM block or default CHID_1.ge file found; skipping geometry");
+    return false;
+  }
+
+  fs::path ge2_path = ge_path;
+  ge2_path.replace_extension(".ge2");
+  if (!fs::exists(ge2_path)) {
+    throw std::runtime_error("Found GE file but missing matching GE2 file: " + ge2_path.string());
+  }
+
+  fs::path geom_dir = args.out_dir / "geometry";
+  fs::create_directories(geom_dir);
+
+  status(args, shared, "[geom] reading GE : " + ge_path.string());
+  status(args, shared, "[geom] reading GE2: " + ge2_path.string());
+
+  auto meshes = bsmv::read_fds_ge_split_by_geom(
+      ge_path,
+      ge2_path,
+      smv.geom.n_geometry,
+      &smv.geom);
+
+  std::vector<bsmv::GeomOutputInfo> manifest_items;
+
+  for (const auto &gm : meshes) {
+    if (gm.faces_1based.empty()) {
+      status(args, shared, "[geom] GEOM " + std::to_string(gm.geom_index_1based) + " has no faces; skipping OBJ");
+      continue;
+    }
+
+    const std::string obj_name =
+        args.chid + "_geom_" + zero4(gm.geom_index_1based) + ".obj";
+    const fs::path obj_path = geom_dir / obj_name;
+    bsmv::write_obj(obj_path, gm);
+
+    bsmv::GeomOutputInfo info;
+    info.geom_index_1based = gm.geom_index_1based;
+    info.obj_filename = obj_name;
+    info.n_vertices = static_cast<int>(gm.vertices.size());
+    info.n_faces = static_cast<int>(gm.faces_1based.size());
+    info.bbox = gm.bbox;
+    manifest_items.push_back(info);
+
+    status(args, shared,
+           "[geom] wrote " + obj_path.string() +
+           " vertices=" + std::to_string(info.n_vertices) +
+           " faces=" + std::to_string(info.n_faces));
+  }
+
+  const fs::path manifest_path = geom_dir / "geometry_manifest.json";
+  bsmv::write_geometry_manifest(manifest_path, args.chid, ge_path, ge2_path, manifest_items);
+  status(args, shared, "[geom] wrote " + manifest_path.string());
+
+  return true;
 }
 
 bool select_density_max(
@@ -313,8 +409,19 @@ int main(int argc, char **argv) {
 
     SharedState shared;
 
+    fs::create_directories(args.out_dir);
+
     status(args, shared, "Parsing SMV: " + args.smv_path.string());
     const bsmv::SmvData smv = bsmv::parse_smv_file(args.smv_path);
+
+    if (!args.no_geom) {
+      write_geometry_from_smv(args, shared, smv);
+    }
+
+    if (args.geom_only) {
+      status(args, shared, "Done with --geom-only.");
+      return 0;
+    }
 
     auto temp_by_mesh = bsmv::find_smokf3d_entries(smv, args.temperature_quantity);
     auto dens_by_mesh = bsmv::find_smokf3d_entries(smv, args.density_quantity);
@@ -332,7 +439,6 @@ int main(int argc, char **argv) {
       throw std::runtime_error("No meshes have both requested smoke quantities.");
     }
 
-    fs::create_directories(args.out_dir);
     status(args, shared, "Writing VDB sequences to: " + fs::absolute(args.out_dir).string());
 
     openvdb::initialize();

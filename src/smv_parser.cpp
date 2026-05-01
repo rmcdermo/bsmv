@@ -39,6 +39,81 @@ std::vector<std::string> split_ws(const std::string &s) {
   return out;
 }
 
+bool parse_int_token(const std::string &tok, int &value) {
+  try {
+    std::size_t pos = 0;
+    const int v = std::stoi(tok, &pos);
+    if (pos == tok.size()) {
+      value = v;
+      return true;
+    }
+  } catch (...) {
+  }
+  return false;
+}
+
+bool parse_double_token(const std::string &tok, double &value) {
+  try {
+    std::size_t pos = 0;
+    const double v = std::stod(tok, &pos);
+    if (pos == tok.size()) {
+      value = v;
+      return true;
+    }
+  } catch (...) {
+  }
+  return false;
+}
+
+int parse_optional_count_after_keyword(
+    const std::vector<std::string> &lines,
+    int &i,
+    const std::vector<std::string> &toks) {
+  int n = 0;
+  if (toks.size() >= 2 && parse_int_token(toks[1], n)) return n;
+
+  const int j = next_nonempty(lines, i + 1);
+  if (j < static_cast<int>(lines.size())) {
+    const auto ntoks = split_ws(lines[j]);
+    if (ntoks.size() == 1 && parse_int_token(ntoks[0], n)) {
+      i = j;
+      return n;
+    }
+  }
+  return 0;
+}
+
+int parse_last_int_or_zero(const std::string &s) {
+  const auto toks = split_ws(s);
+  for (auto it = toks.rbegin(); it != toks.rend(); ++it) {
+    int v = 0;
+    if (parse_int_token(*it, v)) return v;
+  }
+  return 0;
+}
+
+bool looks_like_ge_file(const std::string &s) {
+  const std::string u = upper_copy(trim(s));
+  return u.size() >= 3 &&
+         (u.find(".GE") != std::string::npos ||
+          u.find(".GE2") != std::string::npos);
+}
+
+bool looks_like_new_smv_keyword(const std::string &s) {
+  const std::string u = upper_copy(trim(s));
+  if (u.empty()) return false;
+
+  static const char *keys[] = {
+      "CHID",      "GRID",      "TRNX",     "TRNY",     "TRNZ",
+      "SMOKF3D",   "GEOM",      "BOXGEOM",  "SLCF",     "BNDF",
+      "BNDE",      "ISOF",      "PRT5",     "DEVICE",   "VIEWTIMES",
+      "HRRPUV_MINMAX", "TEMP_MINMAX", "CLASS_OF_PARTICLES", "CSVF"};
+  for (const char *k : keys) {
+    if (u == k || u.rfind(std::string(k) + " ", 0) == 0) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 std::string trim(const std::string &s) {
@@ -110,6 +185,73 @@ SmvData parse_smv_file(const std::filesystem::path &path) {
       continue;
     }
 
+    if (key.rfind("BOXGEOM", 0) == 0) {
+      const auto toks = split_ws(lines[i]);
+      int nbox = parse_optional_count_after_keyword(lines, i, toks);
+      if (nbox <= 0 && smv.geom.n_geometry > 0) nbox = smv.geom.n_geometry;
+
+      ++i;
+      for (int g = 0; g < nbox; ++g) {
+        i = next_nonempty(lines, i);
+        if (i >= static_cast<int>(lines.size())) break;
+        if (looks_like_new_smv_keyword(lines[i])) break;
+
+        const auto btoks = split_ws(lines[i]);
+        if (btoks.size() >= 6 && g < static_cast<int>(smv.geom.entries.size())) {
+          bool ok = true;
+          for (int q = 0; q < 6; ++q) {
+            double v = 0.0;
+            if (!parse_double_token(btoks[q], v)) {
+              ok = false;
+              break;
+            }
+            smv.geom.entries[static_cast<std::size_t>(g)].bbox[static_cast<std::size_t>(q)] = v;
+          }
+          if (!ok) {
+            // Keep going. BOXGEOM is useful but not required to read the .ge file.
+          }
+        }
+        ++i;
+      }
+      continue;
+    }
+
+    if (key.rfind("GEOM", 0) == 0) {
+      const auto toks = split_ws(lines[i]);
+      smv.geom.n_geometry = parse_optional_count_after_keyword(lines, i, toks);
+      smv.geom.entries.clear();
+      smv.geom.entries.reserve(static_cast<std::size_t>(std::max(0, smv.geom.n_geometry)));
+
+      ++i;
+      i = next_nonempty(lines, i);
+
+      if (i < static_cast<int>(lines.size()) && looks_like_ge_file(lines[i])) {
+        smv.geom.ge_filename = trim(lines[i]);
+        ++i;
+      }
+
+      for (int g = 1; g <= smv.geom.n_geometry; ++g) {
+        i = next_nonempty(lines, i);
+        if (i >= static_cast<int>(lines.size())) break;
+        if (looks_like_new_smv_keyword(lines[i])) break;
+
+        GeomSmvEntry ent;
+        ent.geom_index_1based = g;
+        ent.metadata_line = trim(lines[i]);
+        ent.n_faces_hint = parse_last_int_or_zero(ent.metadata_line);
+        smv.geom.entries.push_back(std::move(ent));
+        ++i;
+      }
+
+      while (static_cast<int>(smv.geom.entries.size()) < smv.geom.n_geometry) {
+        GeomSmvEntry ent;
+        ent.geom_index_1based = static_cast<int>(smv.geom.entries.size()) + 1;
+        smv.geom.entries.push_back(std::move(ent));
+      }
+
+      continue;
+    }
+
     if (key.rfind("GRID", 0) == 0) {
       i = next_nonempty(lines, i + 1);
       if (i >= static_cast<int>(lines.size())) break;
@@ -165,7 +307,8 @@ SmvData parse_smv_file(const std::filesystem::path &path) {
           got_z = true;
           break;
         }
-        if (subkey.rfind("SMOKF3D", 0) == 0 || subkey.rfind("GRID", 0) == 0) {
+        if (subkey.rfind("SMOKF3D", 0) == 0 || subkey.rfind("GRID", 0) == 0 ||
+            subkey.rfind("GEOM", 0) == 0 || subkey.rfind("BOXGEOM", 0) == 0) {
           break;
         }
         ++i;
