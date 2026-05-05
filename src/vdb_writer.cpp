@@ -3,6 +3,8 @@
 #include <openvdb/openvdb.h>
 
 #include <cmath>
+#include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -18,18 +20,33 @@ inline std::size_t idx_fortran(int i, int j, int k, int nx, int ny, int /*nz*/) 
                                          static_cast<std::size_t>(ny) * static_cast<std::size_t>(k));
 }
 
-void add_grid_data(openvdb::FloatGrid &grid, const std::vector<float> &arr, int nx, int ny, int nz) {
+std::uint64_t add_grid_data_thresholded(
+    openvdb::FloatGrid &grid,
+    const std::vector<float> &arr,
+    int nx, int ny, int nz,
+    float cutoff) {
   auto accessor = grid.getAccessor();
+  std::uint64_t active = 0;
+
   for (int k = 0; k < nz; ++k) {
     for (int j = 0; j < ny; ++j) {
       for (int i = 0; i < nx; ++i) {
         const float v = arr[idx_fortran(i, j, k, nx, ny, nz)];
-        if (v != 0.0f) {
+
+        // OpenVDB is sparse, but only if we do not activate visually irrelevant
+        // low-level background values. A cutoff of 0 restores the previous
+        // behavior: any nonzero value becomes active.
+        if (v > cutoff) {
           accessor.setValue(openvdb::Coord(i, j, k), v);
+          ++active;
         }
       }
     }
   }
+
+  // Collapse any uniform active regions into tiles when possible.
+  grid.tree().prune();
+  return active;
 }
 
 }  // namespace
@@ -47,11 +64,12 @@ std::tuple<double, double> minmax(const std::vector<float> &arr) {
   return {mn, mx};
 }
 
-void write_vdb(
+VdbWriteStats write_vdb(
     const std::filesystem::path &filepath,
     const std::vector<float> &temperature,
     const std::vector<float> &density,
-    int nx, int ny, int nz) {
+    int nx, int ny, int nz,
+    const VdbThresholdOptions &options) {
 
   auto temp_grid = openvdb::FloatGrid::create(/*background=*/0.0f);
   temp_grid->setName("temperature");
@@ -61,15 +79,38 @@ void write_vdb(
   dens_grid->setName("density");
   dens_grid->setTransform(openvdb::math::Transform::createLinearTransform(1.0));
 
-  add_grid_data(*temp_grid, temperature, nx, ny, nz);
-  add_grid_data(*dens_grid, density, nx, ny, nz);
+  VdbWriteStats stats;
+  stats.temperature_active_voxels = add_grid_data_thresholded(
+      *temp_grid, temperature, nx, ny, nz, options.temperature_cutoff);
+  stats.density_active_voxels = add_grid_data_thresholded(
+      *dens_grid, density, nx, ny, nz, options.density_cutoff);
+
+  openvdb::GridPtrVec grids;
+  if (stats.temperature_active_voxels > 0) {
+    grids.push_back(temp_grid);
+  }
+  if (stats.density_active_voxels > 0) {
+    grids.push_back(dens_grid);
+  }
+
+  // Important for thresholded sparse output: do not write empty VDB files.
+  // Blender can import such files as VOLUME datablocks, but obj.data.grids
+  // will be empty, which makes them impossible to shade and confuses the
+  // sparse loader. The manifest should only reference files that actually
+  // contain at least one named FloatGrid.
+  if (grids.empty()) {
+    std::error_code ec;
+    std::filesystem::remove(filepath, ec);
+    stats.wrote_file = false;
+    return stats;
+  }
 
   openvdb::io::File file(filepath.string());
-  openvdb::GridPtrVec grids;
-  grids.push_back(temp_grid);
-  grids.push_back(dens_grid);
   file.write(grids);
   file.close();
+
+  stats.wrote_file = true;
+  return stats;
 }
 
 void write_manifest(
@@ -83,7 +124,9 @@ void write_manifest(
     double ambient_c,
     double temp_min_smv,
     double temp_max_smv,
-    double smoke_mass_extinction) {
+    double smoke_mass_extinction,
+    double temperature_cutoff,
+    double density_cutoff) {
   const auto spacing_x = x.size() > 1 ? (x[1] - x[0]) : 1.0;
   const auto spacing_y = y.size() > 1 ? (y[1] - y[0]) : 1.0;
   const auto spacing_z = z.size() > 1 ? (z[1] - z[0]) : 1.0;
@@ -106,6 +149,8 @@ void write_manifest(
   out << "  \"temperature_decode_min_c\": " << temp_min_smv << ",\n";
   out << "  \"temperature_decode_max_c\": " << temp_max_smv << ",\n";
   out << "  \"smoke_mass_extinction\": " << smoke_mass_extinction << ",\n";
+  out << "  \"temperature_activation_cutoff\": " << temperature_cutoff << ",\n";
+  out << "  \"density_activation_cutoff\": " << density_cutoff << ",\n";
   out << "  \"node_centered\": true,\n";
   out << "  \"spacing\": [" << spacing_x << ", " << spacing_y << ", " << spacing_z << "],\n";
   out << "  \"origin\": [" << x.front() << ", " << y.front() << ", " << z.front() << "],\n";
@@ -126,7 +171,9 @@ void write_manifest(
     out << "      \"temperature_min\": " << fr.temperature_min << ",\n";
     out << "      \"temperature_max\": " << fr.temperature_max << ",\n";
     out << "      \"density_min\": " << fr.density_min << ",\n";
-    out << "      \"density_max\": " << fr.density_max << "\n";
+    out << "      \"density_max\": " << fr.density_max << ",\n";
+    out << "      \"temperature_active_voxels\": " << fr.temperature_active_voxels << ",\n";
+    out << "      \"density_active_voxels\": " << fr.density_active_voxels << "\n";
     out << "    }" << (i + 1 < frames.size() ? "," : "") << "\n";
   }
 

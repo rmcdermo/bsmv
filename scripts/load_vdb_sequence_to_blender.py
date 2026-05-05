@@ -8,9 +8,9 @@ from pathlib import Path
 # User controls
 # -----------------------------------------------------------------------------
 BLENDER_AUTORUN = True
-BLENDER_CHID = "simple_test"
+BLENDER_CHID = "FM_15cm_Burner_C2H4_16p8_5mm"
 BLENDER_MESH_IDS = None
-BLENDER_VDB_DIR = "/Users/rmcdermo/GitHub/firemodels/fds/Verification/Fires/vdb_sequence_simple"
+BLENDER_VDB_DIR = "/Users/rmcdermo/spark_home/rmcdermo/GitHub/firemodels/fds/Validation/FM_Burner/Blender_Test/vdb_sequence_16p8_5mm"
 
 # Loading / ordering
 BLENDER_SORT_MODE = "mesh"       # "mesh", "rank", or "signal"
@@ -20,19 +20,19 @@ BLENDER_MANIFEST_STRIDE = 1
 BLENDER_SKIP_EXISTING = False
 BLENDER_SKIP_BAD_MANIFESTS = True
 BLENDER_SKIP_MISSING_VDB = True
-BLENDER_PRINT_EVERY = 10
+BLENDER_PRINT_EVERY = 1 
 
 # Optional signal filtering
 SIGNAL_REQUIRE_DATA = False
 SIGNAL_TEMP_MIN = 400.0
 SIGNAL_DENSITY_MIN = 1.0e-10
 SIGNAL_TEMP_WEIGHT = 1.0
-SIGNAL_DENSITY_WEIGHT = 0.25
+SIGNAL_DENSITY_WEIGHT = 1.0
 
 # Flame controls
-FLAME_TEMP_MIN = 400.0
+FLAME_TEMP_MIN = 600.0
 FLAME_TEMP_MAX = 1200.0
-EMISSION_STRENGTH = 12.0
+EMISSION_STRENGTH = 1.0
 
 # Smoke controls
 USE_SMOKE = True
@@ -44,15 +44,15 @@ SMOKE_ANISOTROPY = 0.0
 # where
 #   K_m   = smoke_mass_extinction from the manifest
 #   d_eff = cbrt(dx*dy*dz) from manifest spacing
-USE_AUTO_SMOKE_SCALE = True
+USE_AUTO_SMOKE_SCALE = False
 SMOKE_SCALE_MULTIPLIER = 1.0
 
 # Manual fallback if auto metadata is missing or auto mode is disabled
 SMOKE_DENSITY_SCALE = 1.0
 
 # Scene settings
-SET_CYCLES = False
-SET_EEVEE = True
+SET_CYCLES = True
+SET_EEVEE = False
 SCENE_FPS = 10
 VDB_COLLECTION_NAME = "FDS_VDB_VOLUMES"
 CASE_PARENT_NAME = "FDS_VDB_CASE"

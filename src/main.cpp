@@ -38,6 +38,8 @@ struct Args {
   fs::path result_dir = ".";
   fs::path out_dir = "vdb_sequence";
   fs::path geom_dir = "geometry";
+  float temperature_cutoff = 20.0f;  // degC above ambient; 0 restores old near-all-nonzero behavior
+  float density_cutoff = 1.0e-8f;    // kg/m3; 0 restores old near-all-nonzero behavior
   std::string temperature_quantity = "EFFECTIVE FLAME TEMPERATURE";
   std::string density_quantity = "SOOT DENSITY";
   std::optional<int> start;
@@ -76,6 +78,8 @@ Args parse_args(int argc, char **argv) {
     else if (a == "--result-dir") args.result_dir = need(a);
     else if (a == "--out-dir") args.out_dir = need(a);
     else if (a == "--geom-dir") args.geom_dir = need(a);
+    else if (a == "--temperature-cutoff") args.temperature_cutoff = std::max(0.0f, std::stof(need(a)));
+    else if (a == "--density-cutoff") args.density_cutoff = std::max(0.0f, std::stof(need(a)));
     else if (a == "--temperature-quantity") args.temperature_quantity = need(a);
     else if (a == "--density-quantity") args.density_quantity = need(a);
     else if (a == "--start") args.start = std::stoi(need(a));
@@ -93,6 +97,9 @@ Args parse_args(int argc, char **argv) {
         "  --result-dir DIR\n"
         "  --out-dir DIR       Directory for VDB output, default vdb_sequence\n"
         "  --geom-dir DIR      Directory for GEOM/OBJ output, default geometry\n"
+        "  --temperature-cutoff C   Only activate VDB temperature voxels above C degC above ambient, default 20\n"
+        "  --density-cutoff R       Only activate VDB density voxels above R kg/m3, default 1e-8\n"
+        "                         Use 0 for either cutoff to restore old all-nonzero behavior\n"
         "  --temperature-quantity NAME\n"
         "  --density-quantity NAME\n"
         "  --start N\n"
@@ -365,28 +372,47 @@ bool process_mesh(
       const std::string out_name =
           args.chid + "_mesh_" + zero4(mesh_id) + "_frame_" + zero4(iframe) + ".vdb";
       const fs::path out_path = args.out_dir / out_name;
-      bsmv::write_vdb(out_path, temperature, density, temp_reader.header().nx,
-                      temp_reader.header().ny, temp_reader.header().nz);
+      const bsmv::VdbThresholdOptions vdb_opts{args.temperature_cutoff, args.density_cutoff};
+      const bsmv::VdbWriteStats vdb_stats = bsmv::write_vdb(
+          out_path, temperature, density, temp_reader.header().nx,
+          temp_reader.header().ny, temp_reader.header().nz, vdb_opts);
 
-      const auto [tmin, tmax] = bsmv::minmax(temperature);
-      const auto [dmin, dmax] = bsmv::minmax(density);
+      // With thresholded sparse output, a selected frame may have no active
+      // temperature or density voxels. In that case write_vdb intentionally
+      // does not create a .vdb file, and we must not add it to the manifest.
+      // Otherwise Blender imports a VOLUME object whose obj.data.grids is empty.
+      if (!vdb_stats.wrote_file) {
+        if (!args.quiet && args.progress_every > 0 && (iframe % args.progress_every == 0)) {
+          status(args, shared,
+                 mesh_prefix("skip", mesh_id) +
+                 "frame " + std::to_string(iframe) +
+                 " has no active voxels after thresholding");
+        }
+      } else {
+        const auto [tmin, tmax] = bsmv::minmax(temperature);
+        const auto [dmin, dmax] = bsmv::minmax(density);
 
-      bsmv::ManifestFrameInfo info;
-      info.frame_index = iframe;
-      info.time = static_cast<double>(temp_frame.time);
-      info.filename = out_name;
-      info.temperature_min = tmin;
-      info.temperature_max = tmax;
-      info.density_min = dmin;
-      info.density_max = dmax;
-      manifest_frames.push_back(info);
+        bsmv::ManifestFrameInfo info;
+        info.frame_index = iframe;
+        info.time = static_cast<double>(temp_frame.time);
+        info.filename = out_name;
+        info.temperature_min = tmin;
+        info.temperature_max = tmax;
+        info.density_min = dmin;
+        info.density_max = dmax;
+        info.temperature_active_voxels = vdb_stats.temperature_active_voxels;
+        info.density_active_voxels = vdb_stats.density_active_voxels;
+        manifest_frames.push_back(info);
 
-      if (!args.quiet && (static_cast<int>(manifest_frames.size()) % args.progress_every == 0)) {
-        status(args, shared,
-               mesh_prefix("prog", mesh_id) +
-               "wrote " + std::to_string(manifest_frames.size()) +
-               " frames (latest frame " + std::to_string(iframe) +
-               ", time " + std::to_string(temp_frame.time) + ")");
+        if (!args.quiet && (static_cast<int>(manifest_frames.size()) % args.progress_every == 0)) {
+          status(args, shared,
+                 mesh_prefix("prog", mesh_id) +
+                 "wrote " + std::to_string(manifest_frames.size()) +
+                 " non-empty frames (latest frame " + std::to_string(iframe) +
+                 ", time " + std::to_string(temp_frame.time) +
+                 ", active T/D " + std::to_string(vdb_stats.temperature_active_voxels) +
+                 "/" + std::to_string(vdb_stats.density_active_voxels) + ")");
+        }
       }
     }
 
@@ -405,7 +431,9 @@ bool process_mesh(
       ambient_c,
       temp_min_smv,
       temp_max_smv,
-      dens_ent.value);
+      dens_ent.value,
+      args.temperature_cutoff,
+      args.density_cutoff);
 
   status(args, shared, mesh_prefix("done", mesh_id) +
                            "finished with " + std::to_string(manifest_frames.size()) + " written frames");
@@ -453,6 +481,10 @@ int main(int argc, char **argv) {
     }
 
     status(args, shared, "Writing VDB sequences to: " + fs::absolute(args.out_dir).string());
+    status(args, shared, "VDB activation cutoffs: temperature > " +
+                             std::to_string(args.temperature_cutoff) +
+                             " degC above ambient, density > " +
+                             std::to_string(args.density_cutoff) + " kg/m3");
 
     openvdb::initialize();
 

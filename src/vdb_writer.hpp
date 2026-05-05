@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <tuple>
@@ -15,13 +16,27 @@ struct ManifestFrameInfo {
   double temperature_max = 0.0;
   double density_min = 0.0;
   double density_max = 0.0;
+  std::uint64_t temperature_active_voxels = 0;
+  std::uint64_t density_active_voxels = 0;
 };
 
-void write_vdb(
+struct VdbThresholdOptions {
+  float temperature_cutoff = 20.0f; // degC above ambient
+  float density_cutoff = 1.0e-8f;   // kg/m3
+};
+
+struct VdbWriteStats {
+  std::uint64_t temperature_active_voxels = 0;
+  std::uint64_t density_active_voxels = 0;
+  bool wrote_file = false;
+};
+
+VdbWriteStats write_vdb(
     const std::filesystem::path &filepath,
     const std::vector<float> &temperature,
     const std::vector<float> &density,
-    int nx, int ny, int nz);
+    int nx, int ny, int nz,
+    const VdbThresholdOptions &options = {});
 
 void write_manifest(
     const std::filesystem::path &filepath,
@@ -34,7 +49,9 @@ void write_manifest(
     double ambient_c,
     double temp_min_smv,
     double temp_max_smv,
-    double smoke_mass_extinction);
+    double smoke_mass_extinction,
+    double temperature_cutoff = 20.0,
+    double density_cutoff = 1.0e-8);
 
 std::tuple<double, double> minmax(const std::vector<float> &arr);
 
