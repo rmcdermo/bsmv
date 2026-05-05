@@ -27,30 +27,30 @@ VDB_MANIFEST_STRIDE = 1
 #   "nearest"       = use nearest available VDB frame, good for visual continuity/debugging
 #   "exact_or_hide" = hide mesh if exact frame is missing
 #   "hold_previous" = use most recent prior available frame
-VDB_FRAME_POLICY = "nearest"
+VDB_FRAME_POLICY = "exact_or_hide"
 
 # Correct physical placement from bsmv manifest.
 APPLY_MANIFEST_ORIGIN = True
 APPLY_MANIFEST_SPACING = True
 
 # Render/view.
-SET_RENDERED_VIEW = True
+SET_RENDERED_VIEW = False
 SET_CYCLES = True
 SCENE_FPS = 10
 
 # Cycles volume stepping. Smaller values reveal finer detail but render slower.
-CYCLES_VOLUME_STEP_RATE = 0.15
-CYCLES_VOLUME_PREVIEW_STEP_RATE = 0.15
+CYCLES_VOLUME_STEP_RATE = 0.005
+CYCLES_VOLUME_PREVIEW_STEP_RATE = 0.005
 
 # Volume material transfer-function settings.
 USE_SMOKE = True
-SMOKE_DENSITY_SCALE = 250.0
+SMOKE_DENSITY_SCALE = 8700.0
 SMOKE_COLOR = (0.035, 0.035, 0.035, 1.0)
 
 USE_FLAME = True
-FLAME_TEMP_MIN = 120.0
-FLAME_TEMP_MAX = 900.0
-EMISSION_STRENGTH = 3.0
+FLAME_TEMP_MIN = 600.0
+FLAME_TEMP_MAX = 1200.0
+EMISSION_STRENGTH = 1.0
 
 # Diagnostics.
 PRINT_EVERY = 20
