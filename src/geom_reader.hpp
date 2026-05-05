@@ -33,7 +33,9 @@ std::vector<GeomTriMesh> read_fds_ge_split_by_geom(
 
 void write_obj(
     const std::filesystem::path &path,
-    const GeomTriMesh &mesh);
+    const GeomTriMesh &mesh,
+    const std::vector<SurfaceInfo> &surfaces,
+    const GeomSmvEntry *geom_entry = nullptr);
 
 void write_geometry_manifest(
     const std::filesystem::path &path,

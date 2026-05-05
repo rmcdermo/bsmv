@@ -24,12 +24,12 @@ from mathutils import Vector
 
 BLENDER_AUTORUN = True
 
-BLENDER_CHID = "FM_15cm_Burner_C2H4_20p9_2cm"
+BLENDER_CHID = "FM_15cm_Burner_C2H4_16p8_5mm"
 
 # Absolute paths are safest. Relative paths are resolved relative to the saved
 # .blend file if there is one, otherwise relative to Blender's current directory.
-BLENDER_VDB_DIR = "/Users/rmcdermo/spark_home/rmcdermo/GitHub/firemodels/fds/Validation/FM_Burner/Blender_Test/vdb_sequence"
-BLENDER_GEOM_DIR = "/Users/rmcdermo/spark_home/rmcdermo/GitHub/firemodels/fds/Validation/FM_Burner/Blender_Test/geometry"
+BLENDER_VDB_DIR = "/Users/rmcdermo/spark_home/rmcdermo/GitHub/firemodels/fds/Validation/FM_Burner/Blender_Test/vdb_sequence_dummy"
+BLENDER_GEOM_DIR = "/Users/rmcdermo/spark_home/GitHub/firemodels/fds/Validation/FM_Burner/Blender_Test/geometry_16p8_5mm"
 
 BLENDER_LOAD_GEOM = True
 BLENDER_LOAD_SCENE = True
@@ -42,6 +42,10 @@ BLENDER_MAX_MESHES = None
 
 # Only make the first N VDB volume objects visible initially.
 BLENDER_VISIBLE_COUNT = 12
+
+# bsmv OBJ files now carry SURF_ID colors through .mtl files. Keep this False
+# to preserve those imported materials. Set True only if you want all GEOM gray.
+BLENDER_FORCE_NEUTRAL_GEOM_MATERIAL = False
 
 BLENDER_SKIP_EXISTING_GEOM = True
 BLENDER_SKIP_EXISTING_VDB = True
@@ -202,7 +206,7 @@ def import_bsmv_geometry(geom_dir: str | Path, chid: str) -> list[bpy.types.Obje
         return []
 
     coll = get_or_create_collection("bsmv_geometry")
-    mat = geom_material()
+    mat = geom_material() if BLENDER_FORCE_NEUTRAL_GEOM_MATERIAL else None
     imported: list[bpy.types.Object] = []
 
     print(f"[geom] importing {len(obj_files)} OBJ file(s) from {geom_dir}")
@@ -219,7 +223,7 @@ def import_bsmv_geometry(geom_dir: str | Path, chid: str) -> list[bpy.types.Obje
             obj.name = base_name if len(new_objs) == 1 else f"{base_name}_{n + 1:02d}"
             obj.data.name = obj.name + "_mesh"
             move_object_to_collection(obj, coll)
-            if hasattr(obj.data, "materials"):
+            if mat is not None and hasattr(obj.data, "materials"):
                 obj.data.materials.clear()
                 obj.data.materials.append(mat)
             obj.hide_viewport = False

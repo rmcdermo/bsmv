@@ -1,10 +1,13 @@
 #include "geom_reader.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -88,6 +91,7 @@ std::string json_escape(const std::string &s) {
   return out.str();
 }
 
+
 void update_bbox(std::array<double, 6> &bbox, const std::array<float, 3> &v, bool first) {
   if (first) {
     bbox = {v[0], v[0], v[1], v[1], v[2], v[2]};
@@ -99,6 +103,134 @@ void update_bbox(std::array<double, 6> &bbox, const std::array<float, 3> &v, boo
   bbox[3] = std::max<double>(bbox[3], v[1]);
   bbox[4] = std::min<double>(bbox[4], v[2]);
   bbox[5] = std::max<double>(bbox[5], v[2]);
+}
+
+std::string upper_ascii(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+  return s;
+}
+
+std::string material_safe_token(const std::string &text) {
+  std::string out;
+  out.reserve(text.size());
+  for (const unsigned char c : text) {
+    if (std::isalnum(c) || c == '_' || c == '-' || c == '.') {
+      out.push_back(static_cast<char>(c));
+    } else if (std::isspace(c)) {
+      out.push_back('_');
+    }
+  }
+  if (out.empty()) out = "unnamed";
+  return out;
+}
+
+std::string geom_surface_hint(const GeomSmvEntry *entry) {
+  if (!entry) return {};
+  const std::string &line = entry->metadata_line;
+  const auto pct = line.find('%');
+  if (pct == std::string::npos) return {};
+  const auto bang = line.find('!', pct + 1);
+  if (bang == std::string::npos) return trim(line.substr(pct + 1));
+  return trim(line.substr(pct + 1, bang - pct - 1));
+}
+
+const SurfaceInfo *surface_by_index(const std::vector<SurfaceInfo> &surfaces, int index) {
+  for (const auto &sf : surfaces) {
+    if (sf.surface_index == index) return &sf;
+  }
+  if (index >= 0 && index < static_cast<int>(surfaces.size())) {
+    return &surfaces[static_cast<std::size_t>(index)];
+  }
+  return nullptr;
+}
+
+const SurfaceInfo *surface_by_id(const std::vector<SurfaceInfo> &surfaces, const std::string &id) {
+  const std::string want = upper_ascii(trim(id));
+  if (want.empty()) return nullptr;
+  for (const auto &sf : surfaces) {
+    if (upper_ascii(trim(sf.id)) == want) return &sf;
+  }
+  return nullptr;
+}
+
+bool same_surface(const SurfaceInfo *a, const SurfaceInfo *b) {
+  if (!a || !b) return false;
+  return upper_ascii(trim(a->id)) == upper_ascii(trim(b->id));
+}
+
+const SurfaceInfo *choose_surface_for_surf_id(
+    int surf_id,
+    const std::string &geom_hint,
+    const std::vector<SurfaceInfo> &surfaces) {
+  const SurfaceInfo *fallback = surface_by_id(surfaces, geom_hint);
+
+  if (surf_id < 0) return fallback;
+
+  const SurfaceInfo *exact = surface_by_index(surfaces, surf_id);
+  const SurfaceInfo *one_based = surf_id > 0 ? surface_by_index(surfaces, surf_id - 1) : nullptr;
+
+  // The .ge SURF indices normally match the 0-based SURFACE order in the .smv
+  // file. This fallback logic keeps us robust if a file stores a one-based index
+  // on a GEOM whose metadata line identifies its default SURF_ID.
+  if (fallback && same_surface(exact, fallback)) return exact;
+  if (fallback && same_surface(one_based, fallback)) return one_based;
+
+  if (exact) return exact;
+  if (one_based && !exact) return one_based;
+  return fallback;
+}
+
+struct MaterialRecord {
+  std::string name;
+  std::string label;
+  int surf_id = -999999;
+  std::array<double, 3> rgb = {0.7, 0.7, 0.7};
+  double alpha = 1.0;
+};
+
+MaterialRecord material_record_for_face(
+    int surf_id,
+    const std::string &geom_hint,
+    const std::vector<SurfaceInfo> &surfaces) {
+  MaterialRecord rec;
+  rec.surf_id = surf_id;
+
+  const SurfaceInfo *sf = choose_surface_for_surf_id(surf_id, geom_hint, surfaces);
+  if (sf) {
+    rec.label = sf->id;
+    rec.rgb = sf->rgb;
+    rec.alpha = sf->transparency;
+    rec.name = "surf_" + std::to_string(sf->surface_index) + "_" + material_safe_token(sf->id);
+  } else if (!trim(geom_hint).empty()) {
+    rec.label = geom_hint;
+    rec.name = "geom_hint_" + material_safe_token(geom_hint);
+  } else {
+    rec.label = "surf_id_" + std::to_string(surf_id);
+    rec.name = "surf_id_" + std::to_string(surf_id);
+  }
+  return rec;
+}
+
+void write_mtl_file(const std::filesystem::path &path, const std::map<std::string, MaterialRecord> &materials) {
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("Could not write MTL file: " + path.string());
+
+  out << std::fixed << std::setprecision(9);
+  out << "# bsmv GEOM materials from SMV SURFACE blocks\n";
+  for (const auto &kv : materials) {
+    const auto &mat = kv.second;
+    const double alpha = std::max(0.0, std::min(1.0, mat.alpha));
+    out << "\nnewmtl " << mat.name << "\n";
+    out << "# label " << mat.label << "\n";
+    out << "# surf_id " << mat.surf_id << "\n";
+    out << "Ka " << mat.rgb[0] << " " << mat.rgb[1] << " " << mat.rgb[2] << "\n";
+    out << "Kd " << mat.rgb[0] << " " << mat.rgb[1] << " " << mat.rgb[2] << "\n";
+    out << "Ks 0.000000000 0.000000000 0.000000000\n";
+    out << "d " << alpha << "\n";
+    out << "Tr " << (1.0 - alpha) << "\n";
+    out << "illum 2\n";
+  }
 }
 
 }  // namespace
@@ -225,23 +357,51 @@ std::vector<GeomTriMesh> read_fds_ge_split_by_geom(
   return out;
 }
 
-void write_obj(const std::filesystem::path &path, const GeomTriMesh &mesh) {
+void write_obj(
+    const std::filesystem::path &path,
+    const GeomTriMesh &mesh,
+    const std::vector<SurfaceInfo> &surfaces,
+    const GeomSmvEntry *geom_entry) {
   std::ofstream out(path);
   if (!out) throw std::runtime_error("Could not write OBJ file: " + path.string());
 
+  const std::string geom_hint = geom_surface_hint(geom_entry);
+
+  std::vector<std::string> face_materials;
+  face_materials.reserve(mesh.faces_1based.size());
+  std::map<std::string, MaterialRecord> materials;
+  for (std::size_t i = 0; i < mesh.faces_1based.size(); ++i) {
+    const int surf_id = i < mesh.surf_ids.size() ? mesh.surf_ids[i] : -1;
+    MaterialRecord rec = material_record_for_face(surf_id, geom_hint, surfaces);
+    face_materials.push_back(rec.name);
+    materials.emplace(rec.name, rec);
+  }
+
+  std::filesystem::path mtl_filename = path.filename();
+  mtl_filename.replace_extension(".mtl");
+  const std::filesystem::path mtl_path = path.parent_path() / mtl_filename;
+  write_mtl_file(mtl_path, materials);
+
   out << "# bsmv GEOM " << mesh.geom_index_1based << "\n";
+  if (!geom_hint.empty()) out << "# geom_surface_hint " << geom_hint << "\n";
+  out << "mtllib " << mtl_filename.string() << "\n";
   out << "o geom_" << std::setw(4) << std::setfill('0') << mesh.geom_index_1based << std::setfill(' ') << "\n";
 
   for (const auto &v : mesh.vertices) {
     out << std::setprecision(9) << "v " << v[0] << " " << v[1] << " " << v[2] << "\n";
   }
 
+  std::string last_material;
   int last_surf = -999999;
   for (std::size_t i = 0; i < mesh.faces_1based.size(); ++i) {
-    const int surf = i < mesh.surf_ids.size() ? mesh.surf_ids[i] : 0;
-    if (surf != last_surf) {
+    const int surf = i < mesh.surf_ids.size() ? mesh.surf_ids[i] : -1;
+    const std::string &mat = face_materials[i];
+    if (mat != last_material || surf != last_surf) {
       out << "g geom_" << std::setw(4) << std::setfill('0') << mesh.geom_index_1based
           << "_surf_" << surf << std::setfill(' ') << "\n";
+      out << "# surf_id " << surf << " material " << mat << "\n";
+      out << "usemtl " << mat << "\n";
+      last_material = mat;
       last_surf = surf;
     }
     const auto &f = mesh.faces_1based[i];

@@ -211,7 +211,12 @@ bool write_geometry_from_smv(const Args &args, SharedState &shared, const bsmv::
     const std::string obj_name =
         args.chid + "_geom_" + zero4(gm.geom_index_1based) + ".obj";
     const fs::path obj_path = args.geom_dir / obj_name;
-    bsmv::write_obj(obj_path, gm);
+    const bsmv::GeomSmvEntry *geom_entry = nullptr;
+    if (gm.geom_index_1based >= 1 &&
+        gm.geom_index_1based <= static_cast<int>(smv.geom.entries.size())) {
+      geom_entry = &smv.geom.entries[static_cast<std::size_t>(gm.geom_index_1based - 1)];
+    }
+    bsmv::write_obj(obj_path, gm, smv.surfaces, geom_entry);
 
     bsmv::GeomOutputInfo info;
     info.geom_index_1based = gm.geom_index_1based;
