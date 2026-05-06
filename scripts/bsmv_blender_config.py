@@ -17,14 +17,6 @@ LOAD_GEOMETRY  = True
 LOAD_SCENE_BOX = True
 LOAD_VDB       = True
 
-# --- Flame support / mesh filtering ---
-# Bias the sparse loader toward hot cells so the flame gets narrower and less blobby.
-SIGNAL_REQUIRE_DATA   = True
-SIGNAL_TEMP_MIN       = 500.0
-SIGNAL_DENSITY_MIN    = 0.0
-SIGNAL_TEMP_WEIGHT    = 1.0
-SIGNAL_DENSITY_WEIGHT = 0.10
-
 # VDB selection.
 VDB_SORT_MODE = "mesh"          # "mesh" or "signal"
 VDB_START_INDEX = 0
@@ -35,7 +27,7 @@ VDB_MANIFEST_STRIDE = 1
 #   "nearest"       = use nearest available VDB frame, good for visual continuity/debugging
 #   "exact_or_hide" = hide mesh if exact frame is missing
 #   "hold_previous" = use most recent prior available frame
-VDB_FRAME_POLICY = "nearest"
+VDB_FRAME_POLICY = "exact_or_hide"
 
 # Correct physical placement from bsmv manifest.
 APPLY_MANIFEST_ORIGIN = True
