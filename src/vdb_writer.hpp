@@ -21,8 +21,8 @@ struct ManifestFrameInfo {
 };
 
 struct VdbThresholdOptions {
-  float temperature_cutoff = 20.0f; // degC above ambient
-  float density_cutoff = 1.0e-8f;   // kg/m3
+  float temperature_cutoff = 0.0f; // degC above ambient; keep any positive excess-T voxel
+  float density_cutoff = 0.0f;     // kg/m3; keep any positive smoke-density voxel
 };
 
 struct VdbWriteStats {
@@ -50,8 +50,8 @@ void write_manifest(
     double temp_min_smv,
     double temp_max_smv,
     double smoke_mass_extinction,
-    double temperature_cutoff = 20.0,
-    double density_cutoff = 1.0e-8);
+    double temperature_cutoff = 0.0,
+    double density_cutoff = 0.0);
 
 std::tuple<double, double> minmax(const std::vector<float> &arr);
 

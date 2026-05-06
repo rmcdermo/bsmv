@@ -1,7 +1,5 @@
 # load_vdb_sparse_to_blender.py
 #
-# Drop-in Blender loader for bsmv output.
-#
 # This script is intentionally self-contained. Put it next to:
 #   bsmv_blender_config.py
 #

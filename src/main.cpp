@@ -38,8 +38,10 @@ struct Args {
   fs::path result_dir = ".";
   fs::path out_dir = "vdb_sequence";
   fs::path geom_dir = "geometry";
-  float temperature_cutoff = 20.0f;  // degC above ambient; 0 restores old near-all-nonzero behavior
-  float density_cutoff = 1.0e-8f;    // kg/m3; 0 restores old near-all-nonzero behavior
+  // Defaults preserve data. Use Blender config to decide what is visible.
+  // Temperature is stored as degC above ambient; cutoff 0 keeps any positive excess-T voxel.
+  float temperature_cutoff = 0.0f;
+  float density_cutoff = 0.0f;
   std::string temperature_quantity = "EFFECTIVE FLAME TEMPERATURE";
   std::string density_quantity = "SOOT DENSITY";
   std::optional<int> start;
@@ -97,9 +99,9 @@ Args parse_args(int argc, char **argv) {
         "  --result-dir DIR\n"
         "  --out-dir DIR       Directory for VDB output, default vdb_sequence\n"
         "  --geom-dir DIR      Directory for GEOM/OBJ output, default geometry\n"
-        "  --temperature-cutoff C   Only activate VDB temperature voxels above C degC above ambient, default 20\n"
-        "  --density-cutoff R       Only activate VDB density voxels above R kg/m3, default 1e-8\n"
-        "                         Use 0 for either cutoff to restore old all-nonzero behavior\n"
+        "  --temperature-cutoff C   Activate VDB temperature voxels above C degC above ambient, default 0\n"
+        "  --density-cutoff R       Activate VDB density voxels above R kg/m3, default 0\n"
+        "                         Use Blender config to decide whether to display smoke/flame\n"
         "  --temperature-quantity NAME\n"
         "  --density-quantity NAME\n"
         "  --start N\n"

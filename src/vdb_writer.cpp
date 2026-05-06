@@ -36,7 +36,7 @@ std::uint64_t add_grid_data_thresholded(
         // OpenVDB is sparse, but only if we do not activate visually irrelevant
         // low-level background values. A cutoff of 0 restores the previous
         // behavior: any nonzero value becomes active.
-        if (v > cutoff) {
+        if (std::isfinite(v) && v > cutoff) {
           accessor.setValue(openvdb::Coord(i, j, k), v);
           ++active;
         }

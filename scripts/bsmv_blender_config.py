@@ -35,7 +35,7 @@ VDB_MANIFEST_STRIDE = 1
 #   "nearest"       = use nearest available VDB frame, good for visual continuity/debugging
 #   "exact_or_hide" = hide mesh if exact frame is missing
 #   "hold_previous" = use most recent prior available frame
-VDB_FRAME_POLICY = "exact_or_hide"
+VDB_FRAME_POLICY = "nearest"
 
 # Correct physical placement from bsmv manifest.
 APPLY_MANIFEST_ORIGIN = True
@@ -53,7 +53,7 @@ CYCLES_VOLUME_PREVIEW_STEP_RATE = 0.001
 # Volume material transfer-function settings.
 # For Material Preview / quick scene checks, keep smoke off so the gray density
 # cloud does not hide the flame. Turn USE_SMOKE back on later for smoke renders.
-USE_SMOKE = False
+USE_SMOKE = True
 SMOKE_DENSITY_SCALE = 100.0
 SMOKE_COLOR = (0.035, 0.035, 0.035, 1.0)
 
