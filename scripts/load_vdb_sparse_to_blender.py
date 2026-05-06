@@ -2,32 +2,36 @@
 #
 # Drop-in Blender loader for bsmv output.
 #
-# Behavior:
-#   If CLEAN_SCENE=True or CLEAR_SCENE=True in bsmv_blender_config.py:
-#     - remove all old bsmv-managed collections/objects first
-#     - reload GEOM OBJ/MTL
-#     - redraw scene/domain box
-#     - reload sparse VDB volumes
-#     - install one frame-change handler
-#
-# This prevents duplicate bsmv_domain_bbox.001, duplicate GEOM, duplicate VDBs, etc.
-#
-# Required config file next to this script:
+# This script is intentionally self-contained. Put it next to:
 #   bsmv_blender_config.py
 #
-# Important config variables:
-#   BLENDER_CHID
-#   BLENDER_GEOM_DIR
-#   BLENDER_VDB_DIR
-#   CLEAN_SCENE = True      # or CLEAR_SCENE = True
+# If CLEAN_SCENE=True, every run removes old bsmv-managed objects/collections
+# before loading new GEOM, scene/domain box, VDB volumes, sun, and camera.
 #
-# Optional config variables are accessed with defaults below.
+# Managed collections:
+#   bsmv_geometry
+#   bsmv_scene
+#   bsmv_vents
+#   bsmv_vdb_volumes
+#   FDS_VDB_VOLUMES
+#
+# Managed object prefixes:
+#   bsmv_domain_bbox
+#   bsmv_mesh_bbox
+#   bsmv_vent
+#   bsmv_sun
+#   bsmv_area_light
+#   bsmv_camera
+#   VDB_
+#   FDS_VDB_CASE
+#   <BLENDER_CHID>_geom_
 
 from __future__ import annotations
 
 import bisect
 import importlib.util
 import json
+import mathutils
 import re
 import sys
 from pathlib import Path
@@ -42,7 +46,6 @@ from bpy.app.handlers import persistent
 # -----------------------------------------------------------------------------
 
 def _resolve_blender_path(path_text: str) -> Path:
-    """Resolve normal paths and Blender // relative paths."""
     s = str(path_text)
     if s.startswith("//"):
         return Path(bpy.path.abspath(s)).resolve()
@@ -50,7 +53,6 @@ def _resolve_blender_path(path_text: str) -> Path:
 
 
 def _script_dir() -> Path:
-    """Best-effort location of this script when run from Blender Text Editor."""
     try:
         if "__file__" in globals() and __file__:
             p = _resolve_blender_path(__file__)
@@ -134,11 +136,14 @@ def abs_path(p: str | Path) -> Path:
     s = str(p)
     if s == "~" or s.startswith("~/"):
         return Path(s).expanduser().resolve()
+
     p = Path(s)
     if p.is_absolute():
         return p.resolve()
+
     if bpy.data.filepath:
         return (Path(bpy.data.filepath).resolve().parent / p).resolve()
+
     return p.resolve()
 
 
@@ -157,7 +162,7 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Clean scene / managed state
+# Cleanup
 # -----------------------------------------------------------------------------
 
 MANAGED_COLLECTION_NAMES = (
@@ -168,10 +173,13 @@ MANAGED_COLLECTION_NAMES = (
     "FDS_VDB_VOLUMES",
 )
 
-MANAGED_OBJECT_PREFIXES = (
+MANAGED_OBJECT_PREFIXES_BASE = (
     "bsmv_domain_bbox",
     "bsmv_mesh_bbox",
     "bsmv_vent",
+    "bsmv_sun",
+    "bsmv_area_light",
+    "bsmv_camera",
     "VDB_",
     "FDS_VDB_CASE",
 )
@@ -184,22 +192,40 @@ def remove_old_handlers() -> None:
                 handler_list.remove(h)
 
 
-def unlink_collection_from_all_parents(coll: bpy.types.Collection) -> None:
-    # Unlink from all scene roots.
-    for scene in bpy.data.scenes:
+def delete_object(obj: bpy.types.Object) -> None:
+    try:
+        bpy.data.objects.remove(obj, do_unlink=True)
+    except Exception:
+        pass
+
+
+def delete_objects_by_prefix(prefix: str) -> None:
+    for obj in list(bpy.data.objects):
+        if obj.name.startswith(prefix):
+            delete_object(obj)
+
+
+def delete_tagged_objects() -> None:
+    for obj in list(bpy.data.objects):
         try:
-            if coll.name in scene.collection.children:
-                scene.collection.children.unlink(coll)
+            if obj.get("bsmv_loader_managed", False):
+                delete_object(obj)
         except Exception:
             pass
 
-    # Unlink from all collections that might own this as a child.
+
+def unlink_collection_from_all_parents(coll: bpy.types.Collection) -> None:
+    for scene in bpy.data.scenes:
+        try:
+            scene.collection.children.unlink(coll)
+        except Exception:
+            pass
+
     for parent in list(bpy.data.collections):
         if parent == coll:
             continue
         try:
-            if coll.name in parent.children:
-                parent.children.unlink(coll)
+            parent.children.unlink(coll)
         except Exception:
             pass
 
@@ -208,46 +234,21 @@ def remove_collection_recursive(coll: bpy.types.Collection | None) -> None:
     if coll is None:
         return
 
-    # Remove child collections first.
     for child in list(coll.children):
         remove_collection_recursive(child)
 
-    # Remove objects directly in this collection.
     for obj in list(coll.objects):
-        try:
-            bpy.data.objects.remove(obj, do_unlink=True)
-        except Exception:
-            pass
+        delete_object(obj)
 
     unlink_collection_from_all_parents(coll)
 
     try:
-        if bpy.data.collections.get(coll.name) is not None:
-            bpy.data.collections.remove(coll)
+        bpy.data.collections.remove(coll)
     except Exception:
         pass
 
 
-def delete_objects_by_prefix(prefix: str) -> None:
-    for obj in list(bpy.data.objects):
-        if obj.name.startswith(prefix):
-            try:
-                bpy.data.objects.remove(obj, do_unlink=True)
-            except Exception:
-                pass
-
-
-def delete_objects_with_loader_tag() -> None:
-    for obj in list(bpy.data.objects):
-        try:
-            if obj.get("bsmv_loader_managed", False):
-                bpy.data.objects.remove(obj, do_unlink=True)
-        except Exception:
-            pass
-
-
-def purge_orphan_datablocks() -> None:
-    # Remove orphan data blocks without relying only on outliner context.
+def purge_orphans() -> None:
     for datablocks in (
         bpy.data.meshes,
         bpy.data.volumes,
@@ -269,40 +270,37 @@ def purge_orphan_datablocks() -> None:
 
 
 def clean_bsmv_scene() -> None:
-    """Remove all previous bsmv-managed objects/collections.
-
-    This is the key cleanup. It runs before every load when CLEAN_SCENE/CLEAR_SCENE
-    is true, and prevents Blender from creating .001, .002 duplicates.
-    """
     remove_old_handlers()
 
-    print("[clean] removing old bsmv-managed objects/collections")
+    print("[clean] removing previous bsmv-managed objects and collections")
 
-    # Remove known managed collections and everything inside them.
+    # Remove managed collections and their contents first.
     for coll_name in MANAGED_COLLECTION_NAMES:
         coll = bpy.data.collections.get(coll_name)
         if coll is not None:
             remove_collection_recursive(coll)
 
-    # Remove tagged objects, if any survived outside a collection.
-    delete_objects_with_loader_tag()
+    # Remove any tagged objects that escaped the collections.
+    delete_tagged_objects()
 
-    # Remove known object prefixes, including .001/.002 copies.
-    for prefix in MANAGED_OBJECT_PREFIXES:
-        delete_objects_by_prefix(prefix)
+    # Remove managed object name prefixes, including .001/.002 duplicates.
+    prefixes = list(MANAGED_OBJECT_PREFIXES_BASE)
 
-    # Also remove current CHID-specific GEOM names, which do not have a fixed global prefix.
     chid = str(C("BLENDER_CHID", ""))
     if chid:
-        delete_objects_by_prefix(f"{chid}_geom_")
-        delete_objects_by_prefix(f"{sanitize_name(chid)}_geom_")
-        delete_objects_by_prefix(f"VDB_{sanitize_name(chid)}_")
+        prefixes.extend([
+            f"{chid}_geom_",
+            f"{sanitize_name(chid)}_geom_",
+            f"VDB_{sanitize_name(chid)}_",
+        ])
 
-    purge_orphan_datablocks()
+    for prefix in prefixes:
+        delete_objects_by_prefix(prefix)
+
+    purge_orphans()
 
 
 def full_scene_clear() -> None:
-    """Optional nuclear clear. Usually not needed."""
     bpy.ops.object.select_all(action="SELECT")
     bpy.ops.object.delete()
 
@@ -312,36 +310,45 @@ def full_scene_clear() -> None:
         except Exception:
             pass
 
-    purge_orphan_datablocks()
+    purge_orphans()
 
 
 def get_or_create_collection(name: str) -> bpy.types.Collection:
+    """Create/get a top-level bsmv collection linked under the scene root."""
     coll = bpy.data.collections.get(name)
     if coll is None:
         coll = bpy.data.collections.new(name)
 
     root = bpy.context.scene.collection
-    if coll.name not in root.children:
+    if coll.name not in [child.name for child in root.children]:
         root.children.link(coll)
 
     return coll
 
 
 def move_to_collection(obj: bpy.types.Object, coll: bpy.types.Collection) -> None:
+    """Move object exclusively into coll.
+
+    Blender imports OBJ/VDB objects into the active/default collection first.
+    If we only link to the target collection, the object still also appears in
+    the default "Collection", which makes the Outliner huge. So unlink it from
+    every other user collection after linking it to coll.
+    """
     if obj.name not in coll.objects:
         coll.objects.link(obj)
 
-    # Unlink from scene root so the object appears only under bsmv collections.
-    try:
-        bpy.context.scene.collection.objects.unlink(obj)
-    except Exception:
-        pass
+    for user_coll in list(obj.users_collection):
+        if user_coll != coll:
+            try:
+                user_coll.objects.unlink(obj)
+            except Exception:
+                pass
 
     obj["bsmv_loader_managed"] = True
 
 
 # -----------------------------------------------------------------------------
-# View/render settings
+# View/render settings, light, camera
 # -----------------------------------------------------------------------------
 
 def set_rendered_view() -> None:
@@ -353,6 +360,8 @@ def set_rendered_view() -> None:
             try:
                 area.spaces.active.shading.type = "RENDERED"
                 area.spaces.active.overlay.show_relationship_lines = False
+                area.spaces.active.clip_start = float(C("VIEW_CLIP_START", 0.001))
+                area.spaces.active.clip_end = float(C("VIEW_CLIP_END", 10000.0))
             except Exception:
                 pass
 
@@ -380,6 +389,119 @@ def set_render_settings() -> None:
                 setattr(cycles, attr, value)
             except Exception:
                 pass
+
+
+def add_basic_lighting() -> None:
+    if not C("ADD_BASIC_LIGHTING", True):
+        return
+
+    # These should already be gone after clean_bsmv_scene(), but keep this safe.
+    delete_objects_by_prefix("bsmv_sun")
+    delete_objects_by_prefix("bsmv_area_light")
+
+    bpy.ops.object.light_add(type="SUN", location=(0.0, 0.0, 3.0))
+    sun = bpy.context.object
+    sun.name = "bsmv_sun"
+    move_to_collection(sun, get_or_create_collection("bsmv_scene"))
+
+    try:
+        sun.data.energy = float(C("SUN_ENERGY", 3.0))
+        sun.rotation_euler = tuple(C("SUN_ROTATION", (0.8, 0.0, -0.6)))
+    except Exception:
+        pass
+
+    try:
+        bpy.context.scene.world.color = C("WORLD_COLOR", (0.8, 0.8, 0.8))
+    except Exception:
+        pass
+
+
+def domain_bbox_from_scene_manifest() -> list[float] | None:
+    try:
+        geom_dir = abs_path(C("BLENDER_GEOM_DIR"))
+        scene_path = geom_dir / "scene_manifest.json"
+        if scene_path.exists():
+            scene = read_json(scene_path)
+            bbox = scene.get("domain_bbox")
+            if bbox and len(bbox) == 6:
+                return [float(v) for v in bbox]
+    except Exception:
+        pass
+    return None
+
+
+def bbox_from_loaded_objects() -> list[float] | None:
+    coords = []
+
+    for obj in bpy.data.objects:
+        if not obj.get("bsmv_loader_managed", False):
+            continue
+        if obj.type not in {"MESH", "VOLUME"}:
+            continue
+        try:
+            for corner in obj.bound_box:
+                coords.append(obj.matrix_world @ mathutils.Vector(corner))
+        except Exception:
+            pass
+
+    if not coords:
+        return None
+
+    xs = [v.x for v in coords]
+    ys = [v.y for v in coords]
+    zs = [v.z for v in coords]
+    return [min(xs), max(xs), min(ys), max(ys), min(zs), max(zs)]
+
+
+def add_basic_camera() -> None:
+    if not C("ADD_BASIC_CAMERA", True):
+        return
+
+    delete_objects_by_prefix("bsmv_camera")
+
+    bbox = domain_bbox_from_scene_manifest()
+    if bbox is None:
+        bbox = bbox_from_loaded_objects()
+    if bbox is None:
+        bbox = [-0.75, 0.75, -0.75, 0.75, 0.0, 2.0]
+
+    xmin, xmax, ymin, ymax, zmin, zmax = bbox
+    cx = 0.5 * (xmin + xmax)
+    cy = 0.5 * (ymin + ymax)
+    cz = 0.5 * (zmin + zmax)
+
+    sx = max(xmax - xmin, 1.0e-6)
+    sy = max(ymax - ymin, 1.0e-6)
+    sz = max(zmax - zmin, 1.0e-6)
+    span = max(sx, sy, sz)
+
+    dx, dy, dz = C("CAMERA_DIRECTION", (-1.25, -2.40, 1.15))
+    distance = float(C("CAMERA_DISTANCE_MULTIPLIER", 1.75)) * span
+
+    direction = mathutils.Vector((float(dx), float(dy), float(dz))).normalized()
+    target = mathutils.Vector((cx, cy, cz + float(C("CAMERA_TARGET_Z_OFFSET", 0.0)) * sz))
+    location = target + direction * distance
+
+    bpy.ops.object.camera_add(location=location)
+    cam = bpy.context.object
+    cam.name = "bsmv_camera"
+    move_to_collection(cam, get_or_create_collection("bsmv_scene"))
+
+    look_dir = target - cam.location
+    cam.rotation_euler = look_dir.to_track_quat("-Z", "Y").to_euler()
+
+    cam.data.lens = float(C("CAMERA_LENS_MM", 35.0))
+    cam.data.clip_start = float(C("CAMERA_CLIP_START", 0.001))
+    cam.data.clip_end = float(C("CAMERA_CLIP_END", 10000.0))
+    cam.data.dof.use_dof = False
+
+    bpy.context.scene.camera = cam
+
+    print(
+        "[camera] added bsmv_camera "
+        f"loc={tuple(round(v, 4) for v in cam.location)} "
+        f"target={tuple(round(v, 4) for v in target)}"
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -467,6 +589,15 @@ def make_wire_box(name: str, bbox: list[float], collection: bpy.types.Collection
     obj.display_type = "WIRE"
     obj.show_in_front = False
     obj["bsmv_loader_managed"] = True
+
+    # Ensure it does not appear in any other collection if Blender auto-links it later.
+    for user_coll in list(obj.users_collection):
+        if user_coll != collection:
+            try:
+                user_coll.objects.unlink(obj)
+            except Exception:
+                pass
+
     return obj
 
 
@@ -700,7 +831,7 @@ def make_vdb_material() -> bpy.types.Material:
             links.new(info.outputs["Temperature"], bb_temp.inputs[0])
             links.new(bb_temp.outputs["Value"], bb.inputs["Temperature"])
 
-        # Principled Volume emission needs some extinction/density for integration.
+        # Principled Volume emission needs some density/extinction for integration.
         if "Density" in vol.inputs:
             vol.inputs["Density"].default_value = float(C("FLAME_BASE_DENSITY", 0.02))
         if "Emission Color" in vol.inputs:
@@ -914,7 +1045,6 @@ def load_vdbs() -> list[bpy.types.Object]:
 # -----------------------------------------------------------------------------
 
 def run() -> None:
-    # CLEAN_SCENE is the preferred name. CLEAR_SCENE is supported for older configs.
     clean_scene = bool(C("CLEAN_SCENE", C("CLEAR_SCENE", True)))
 
     if clean_scene:
@@ -922,11 +1052,11 @@ def run() -> None:
     else:
         remove_old_handlers()
 
-    # Optional nuclear option, off by default.
     if bool(C("NUKE_SCENE", False)):
         full_scene_clear()
 
     set_render_settings()
+    add_basic_lighting()
 
     if C("LOAD_GEOMETRY", True):
         load_geometry()
@@ -937,6 +1067,7 @@ def run() -> None:
     if C("LOAD_VDB", True):
         load_vdbs()
 
+    add_basic_camera()
     set_rendered_view()
     print("[done] sparse loader clean load complete")
 

@@ -11,11 +11,19 @@ BLENDER_GEOM_DIR = "/Users/rmcdermo/spark_home/rmcdermo/GitHub/firemodels/fds/Va
 BLENDER_VDB_DIR  = "/Users/rmcdermo/spark_home/rmcdermo/GitHub/firemodels/fds/Validation/FM_Burner/Blender_Test/vdb_sequence_16p8_5mm"
 
 # This loader is intended to give a clean, complete scene every run.
-CLEAR_SCENE = True
+CLEAN_SCENE = True
 
-LOAD_GEOMETRY = True
+LOAD_GEOMETRY  = True
 LOAD_SCENE_BOX = True
-LOAD_VDB = True
+LOAD_VDB       = True
+
+# --- Flame support / mesh filtering ---
+# Bias the sparse loader toward hot cells so the flame gets narrower and less blobby.
+SIGNAL_REQUIRE_DATA   = True
+SIGNAL_TEMP_MIN       = 500.0
+SIGNAL_DENSITY_MIN    = 0.0
+SIGNAL_TEMP_WEIGHT    = 1.0
+SIGNAL_DENSITY_WEIGHT = 0.10
 
 # VDB selection.
 VDB_SORT_MODE = "mesh"          # "mesh" or "signal"
@@ -50,7 +58,23 @@ SMOKE_COLOR = (0.035, 0.035, 0.035, 1.0)
 USE_FLAME = True
 FLAME_TEMP_MIN = 600.0
 FLAME_TEMP_MAX = 1200.0
-EMISSION_STRENGTH = 1.0
+EMISSION_STRENGTH = 3.0
+
+# Lighting hooks
+ADD_BASIC_LIGHTING = True
+SUN_ENERGY = 3.0
+WORLD_COLOR = (0.8, 0.8, 0.8)
+
+# Camera knobs
+ADD_BASIC_CAMERA = True
+CAMERA_LENS_MM = 35.0
+CAMERA_DISTANCE_MULTIPLIER = 1.75
+CAMERA_DIRECTION = (-1.25, -2.40, 1.15)
+CAMERA_TARGET_Z_OFFSET = 0.0
+CAMERA_CLIP_START = 0.001
+CAMERA_CLIP_END = 10000.0
+VIEW_CLIP_START = 0.001
+VIEW_CLIP_END = 10000.0
 
 # Diagnostics.
 PRINT_EVERY = 20
