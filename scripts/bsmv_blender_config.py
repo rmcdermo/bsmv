@@ -47,12 +47,14 @@ SET_CYCLES = True
 SCENE_FPS = 10
 
 # Cycles volume stepping. Smaller values reveal finer detail but render slower.
-CYCLES_VOLUME_STEP_RATE = 0.005
-CYCLES_VOLUME_PREVIEW_STEP_RATE = 0.005
+CYCLES_VOLUME_STEP_RATE = 0.001
+CYCLES_VOLUME_PREVIEW_STEP_RATE = 0.001
 
 # Volume material transfer-function settings.
-USE_SMOKE = True
-SMOKE_DENSITY_SCALE = 8700.0
+# For Material Preview / quick scene checks, keep smoke off so the gray density
+# cloud does not hide the flame. Turn USE_SMOKE back on later for smoke renders.
+USE_SMOKE = False
+SMOKE_DENSITY_SCALE = 100.0
 SMOKE_COLOR = (0.035, 0.035, 0.035, 1.0)
 
 USE_FLAME = True
@@ -81,3 +83,19 @@ PRINT_EVERY = 20
 PRINT_FIRST_N = 10
 PRINT_FRAME_HANDLER_UPDATES = False
 PRINT_GRID_LOADS = False
+
+# Scene helper drawing; these are now handled by load_vdb_sparse_to_blender.py.
+DRAW_DOMAIN_BOX = True
+DRAW_MESH_BOXES = False
+DRAW_VENTS = True
+DOMAIN_BOX_COLOR = (0.0, 0.0, 0.0, 1.0)
+MESH_BOX_COLOR = (0.8, 0.8, 0.8, 0.35)
+SCENE_WIRES_IN_FRONT = False
+
+# Keep Material Preview clean. This hides camera/light helper overlays and the sun direction line.
+HIDE_LIGHT_CAMERA_EXTRAS = True
+
+# Sun placement: 30 degrees off vertical; azimuth controls side direction.
+SUN_TILT_DEG = 30.0
+SUN_AZIMUTH_DEG = -35.0
+SUN_DISTANCE_MULTIPLIER = 1.25

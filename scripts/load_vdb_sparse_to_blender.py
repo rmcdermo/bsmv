@@ -31,6 +31,7 @@ from __future__ import annotations
 import bisect
 import importlib.util
 import json
+import math
 import mathutils
 import re
 import sys
@@ -351,7 +352,27 @@ def move_to_collection(obj: bpy.types.Object, coll: bpy.types.Collection) -> Non
 # View/render settings, light, camera
 # -----------------------------------------------------------------------------
 
+def apply_viewport_overlay_settings() -> None:
+    """Keep the viewport clean for quick Material/Rendered checks."""
+    for area in bpy.context.screen.areas:
+        if area.type != "VIEW_3D":
+            continue
+        try:
+            space = area.spaces.active
+            space.overlay.show_relationship_lines = False
+            # Hides camera/light helper graphics and the sun direction line. The
+            # camera/light still exist and still affect renders.
+            if C("HIDE_LIGHT_CAMERA_EXTRAS", True):
+                space.overlay.show_extras = False
+            space.clip_start = float(C("VIEW_CLIP_START", 0.001))
+            space.clip_end = float(C("VIEW_CLIP_END", 10000.0))
+        except Exception:
+            pass
+
+
 def set_rendered_view() -> None:
+    apply_viewport_overlay_settings()
+
     if not C("SET_RENDERED_VIEW", True):
         return
 
@@ -359,9 +380,6 @@ def set_rendered_view() -> None:
         if area.type == "VIEW_3D":
             try:
                 area.spaces.active.shading.type = "RENDERED"
-                area.spaces.active.overlay.show_relationship_lines = False
-                area.spaces.active.clip_start = float(C("VIEW_CLIP_START", 0.001))
-                area.spaces.active.clip_end = float(C("VIEW_CLIP_END", 10000.0))
             except Exception:
                 pass
 
@@ -391,6 +409,17 @@ def set_render_settings() -> None:
                 pass
 
 
+def _bbox_center_span(bbox: list[float]) -> tuple[mathutils.Vector, float]:
+    xmin, xmax, ymin, ymax, zmin, zmax = [float(v) for v in bbox]
+    center = mathutils.Vector((
+        0.5 * (xmin + xmax),
+        0.5 * (ymin + ymax),
+        0.5 * (zmin + zmax),
+    ))
+    span = max(xmax - xmin, ymax - ymin, zmax - zmin, 1.0e-6)
+    return center, span
+
+
 def add_basic_lighting() -> None:
     if not C("ADD_BASIC_LIGHTING", True):
         return
@@ -399,14 +428,35 @@ def add_basic_lighting() -> None:
     delete_objects_by_prefix("bsmv_sun")
     delete_objects_by_prefix("bsmv_area_light")
 
-    bpy.ops.object.light_add(type="SUN", location=(0.0, 0.0, 3.0))
+    bbox = domain_bbox_from_scene_manifest()
+    if bbox is None:
+        bbox = [-0.75, 0.75, -0.75, 0.75, 0.0, 2.0]
+    center, span = _bbox_center_span(bbox)
+
+    # Put the sun icon at a useful visual location. For a SUN light, Blender uses
+    # the rotation for illumination direction; the location is just the viewport icon.
+    tilt = math.radians(float(C("SUN_TILT_DEG", 30.0)))       # off vertical
+    azim = math.radians(float(C("SUN_AZIMUTH_DEG", -35.0)))
+    dist = float(C("SUN_DISTANCE_MULTIPLIER", 1.25)) * span
+
+    sun_offset = mathutils.Vector((
+        math.sin(tilt) * math.cos(azim),
+        math.sin(tilt) * math.sin(azim),
+        math.cos(tilt),
+    )) * dist
+
+    bpy.ops.object.light_add(type="SUN", location=center + sun_offset)
     sun = bpy.context.object
     sun.name = "bsmv_sun"
     move_to_collection(sun, get_or_create_collection("bsmv_scene"))
 
     try:
         sun.data.energy = float(C("SUN_ENERGY", 3.0))
-        sun.rotation_euler = tuple(C("SUN_ROTATION", (0.8, 0.0, -0.6)))
+
+        # Aim the sun at the domain center. This also makes the displayed sun
+        # direction line geometrically meaningful if extras are shown.
+        look_dir = center - sun.location
+        sun.rotation_euler = look_dir.to_track_quat("-Z", "Y").to_euler()
     except Exception:
         pass
 
@@ -566,31 +616,66 @@ def load_geometry() -> list[bpy.types.Object]:
     return loaded
 
 
-def make_wire_box(name: str, bbox: list[float], collection: bpy.types.Collection) -> bpy.types.Object:
-    xmin, xmax, ymin, ymax, zmin, zmax = [float(v) for v in bbox]
+def make_material(name: str, rgba=(0.7, 0.7, 0.7, 1.0)) -> bpy.types.Material:
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        mat = bpy.data.materials.new(name)
+    mat.diffuse_color = rgba
+    mat.use_nodes = True
+    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    if bsdf is not None:
+        if "Base Color" in bsdf.inputs:
+            bsdf.inputs["Base Color"].default_value = rgba
+        if "Alpha" in bsdf.inputs:
+            bsdf.inputs["Alpha"].default_value = rgba[3]
+        if "Roughness" in bsdf.inputs:
+            bsdf.inputs["Roughness"].default_value = 0.65
+    mat.blend_method = "BLEND"
+    mat.use_screen_refraction = False
+    return mat
 
+
+def domain_material() -> bpy.types.Material:
+    return make_material("bsmv_domain_wire", C("DOMAIN_BOX_COLOR", (0.0, 0.0, 0.0, 1.0)))
+
+
+def mesh_box_material() -> bpy.types.Material:
+    return make_material("bsmv_mesh_wire", C("MESH_BOX_COLOR", (0.8, 0.8, 0.8, 0.35)))
+
+
+def vent_material(rgb, alpha, suffix: str) -> bpy.types.Material:
+    r, g, b = rgb
+    a = max(0.05, min(1.0, float(alpha)))
+    return make_material(f"bsmv_vent_{suffix}", (float(r), float(g), float(b), a))
+
+
+def bbox_vertices_and_edges(bbox):
+    xmin, xmax, ymin, ymax, zmin, zmax = [float(v) for v in bbox]
     verts = [
         (xmin, ymin, zmin), (xmax, ymin, zmin), (xmax, ymax, zmin), (xmin, ymax, zmin),
         (xmin, ymin, zmax), (xmax, ymin, zmax), (xmax, ymax, zmax), (xmin, ymax, zmax),
     ]
-
     edges = [
         (0, 1), (1, 2), (2, 3), (3, 0),
         (4, 5), (5, 6), (6, 7), (7, 4),
         (0, 4), (1, 5), (2, 6), (3, 7),
     ]
+    return verts, edges
 
+
+def make_wire_box(name: str, bbox: list[float], mat: bpy.types.Material, collection: bpy.types.Collection) -> bpy.types.Object:
+    verts, edges = bbox_vertices_and_edges(bbox)
     mesh = bpy.data.meshes.new(name + "_mesh")
     mesh.from_pydata(verts, edges, [])
     mesh.update()
 
     obj = bpy.data.objects.new(name, mesh)
     collection.objects.link(obj)
+    obj.data.materials.append(mat)
     obj.display_type = "WIRE"
-    obj.show_in_front = False
+    obj.show_in_front = bool(C("SCENE_WIRES_IN_FRONT", False))
     obj["bsmv_loader_managed"] = True
 
-    # Ensure it does not appear in any other collection if Blender auto-links it later.
     for user_coll in list(obj.users_collection):
         if user_coll != collection:
             try:
@@ -601,7 +686,79 @@ def make_wire_box(name: str, bbox: list[float], collection: bpy.types.Collection
     return obj
 
 
+def vent_corners_from_bbox(bbox):
+    xmin, xmax, ymin, ymax, zmin, zmax = [float(x) for x in bbox]
+    dx = abs(xmax - xmin)
+    dy = abs(ymax - ymin)
+    dz = abs(zmax - zmin)
+    eps = 1.0e-8
+
+    if dz <= max(dx, dy, eps) * 1.0e-6:
+        z = 0.5 * (zmin + zmax)
+        return [(xmin, ymin, z), (xmax, ymin, z), (xmax, ymax, z), (xmin, ymax, z)]
+    if dy <= max(dx, dz, eps) * 1.0e-6:
+        y = 0.5 * (ymin + ymax)
+        return [(xmin, y, zmin), (xmax, y, zmin), (xmax, y, zmax), (xmin, y, zmax)]
+    if dx <= max(dy, dz, eps) * 1.0e-6:
+        x = 0.5 * (xmin + xmax)
+        return [(x, ymin, zmin), (x, ymax, zmin), (x, ymax, zmax), (x, ymin, zmax)]
+
+    # Fallback: bottom face.
+    return [(xmin, ymin, zmin), (xmax, ymin, zmin), (xmax, ymax, zmin), (xmin, ymax, zmin)]
+
+
+def make_rect_vent(name: str, bbox, mat: bpy.types.Material, collection: bpy.types.Collection) -> bpy.types.Object:
+    verts = vent_corners_from_bbox(bbox)
+    mesh = bpy.data.meshes.new(name + "_mesh")
+    mesh.from_pydata(verts, [], [(0, 1, 2, 3)])
+    mesh.update()
+
+    obj = bpy.data.objects.new(name, mesh)
+    collection.objects.link(obj)
+    obj.data.materials.append(mat)
+    obj.show_transparent = True
+    obj["bsmv_loader_managed"] = True
+
+    for user_coll in list(obj.users_collection):
+        if user_coll != collection:
+            try:
+                user_coll.objects.unlink(obj)
+            except Exception:
+                pass
+
+    return obj
+
+
+def surface_lookup(scene: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    out: dict[int, dict[str, Any]] = {}
+    for sf in scene.get("surfaces", []):
+        try:
+            out[int(sf.get("surface_index", -999))] = sf
+        except Exception:
+            pass
+    return out
+
+
+def vent_color(vent: dict[str, Any], surfaces: dict[int, dict[str, Any]]):
+    if vent.get("has_rgb"):
+        return vent.get("rgb", [0.7, 0.7, 0.7]), vent.get("transparency", 1.0)
+
+    sf = surfaces.get(int(vent.get("surf_index", -999)))
+    if sf:
+        return sf.get("rgb", [0.7, 0.7, 0.7]), sf.get("transparency", 1.0)
+
+    return [0.7, 0.7, 0.7], 1.0
+
+
+def config_bool(primary: str, fallback: str, default: bool) -> bool:
+    return bool(C(primary, C(fallback, default)))
+
+
 def load_scene_box() -> list[bpy.types.Object]:
+    """Load all scene-manifest helpers: domain, optional mesh boxes, and vents.
+
+    This folds the useful smv_to_blender.py scene work into this single loader.
+    """
     geom_dir = abs_path(C("BLENDER_GEOM_DIR"))
     scene_path = geom_dir / "scene_manifest.json"
 
@@ -610,13 +767,55 @@ def load_scene_box() -> list[bpy.types.Object]:
         return []
 
     scene = read_json(scene_path)
-    coll = get_or_create_collection("bsmv_scene")
-    loaded = []
+    loaded: list[bpy.types.Object] = []
 
-    bbox = scene.get("domain_bbox")
-    if bbox:
-        loaded.append(make_wire_box("bsmv_domain_bbox", bbox, coll))
-        print(f"[scene] drew domain box {bbox}")
+    scene_coll = get_or_create_collection("bsmv_scene")
+
+    draw_domain = config_bool("DRAW_DOMAIN_BOX", "BLENDER_DRAW_DOMAIN_BOX", True)
+    draw_mesh_boxes = config_bool("DRAW_MESH_BOXES", "BLENDER_DRAW_MESH_BOXES", False)
+    draw_vents = config_bool("DRAW_VENTS", "BLENDER_DRAW_VENTS", True)
+
+    if draw_domain and scene.get("domain_bbox"):
+        loaded.append(make_wire_box("bsmv_domain_bbox", scene["domain_bbox"], domain_material(), scene_coll))
+
+    if draw_mesh_boxes:
+        mat = mesh_box_material()
+        for mesh_info in scene.get("meshes", []):
+            try:
+                mid = int(mesh_info.get("mesh_index_1based", 0))
+            except Exception:
+                mid = 0
+            bbox = mesh_info.get("bbox")
+            if bbox:
+                loaded.append(make_wire_box(f"bsmv_mesh_{mid:04d}_bbox", bbox, mat, scene_coll))
+
+    if draw_vents:
+        surfaces = surface_lookup(scene)
+        vent_coll = get_or_create_collection("bsmv_vents")
+        for n, vent in enumerate(scene.get("vents", []), start=1):
+            # Current bsmv scene manifest stores rectangular vents by bbox. Circular
+            # vent caps are already visible from GEOM for this case.
+            if vent.get("circular"):
+                continue
+            if not vent.get("has_bbox"):
+                continue
+            rgb, alpha = vent_color(vent, surfaces)
+            mat = vent_material(rgb, alpha, f"{n:04d}")
+            try:
+                mid = int(vent.get("mesh_index_1based", 0))
+                vid = int(vent.get("vent_index_1based", n))
+            except Exception:
+                mid = 0
+                vid = n
+            loaded.append(make_rect_vent(f"bsmv_vent_m{mid:04d}_{vid:04d}", vent["bbox"], mat, vent_coll))
+
+    print(
+        f"[scene] loaded scene manifest: "
+        f"{len(scene.get('meshes', []))} mesh boxes available, "
+        f"{len(scene.get('surfaces', []))} surfaces, "
+        f"{len(scene.get('vents', []))} vents; "
+        f"drew {len(loaded)} helper object(s)"
+    )
 
     return loaded
 
