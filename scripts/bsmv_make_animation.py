@@ -2,39 +2,26 @@
 """
 bsmv_make_animation.py
 
-One-file animation renderer for bsmv/Blender VDB scenes.
+Serial, one-file animation renderer for bsmv/Blender VDB scenes.
 
-Outer mode:
-  Run this with system Python from a terminal. It launches Blender in batch
-  mode and renders frames either serially or in parallel.
+Run this with system Python from a terminal. It launches a fresh Blender process
+for each frame, waits for that frame to finish, then launches the next frame.
+This is slower than parallel rendering but is much more stable for heavy VDB
+volume scenes.
 
-Inner mode:
-  The same file is also used internally by Blender with -P. You do not normally
-  call this mode yourself.
+Default behavior:
+  - one Blender process at a time
+  - overwrite existing PNGs
+  - Ctrl-C terminates the active Blender process
+  - no separate bsmv_render_single_frame.py is needed
 
-Key behaviors:
-  - By default, existing PNGs are overwritten (better when the .blend camera
-    or scene setup has changed).
-  - Use --skip-existing if you want resume behavior.
-  - Use --jobs N to render frames in parallel with up to N Blender processes.
-  - A single Ctrl-C terminates all active Blender subprocesses.
-  - Parent process prints a periodic heartbeat/status line while frames render.
-
-Examples:
+Example:
   python3 bsmv_make_animation.py \
     --blend FM_15cm_Burner_C2H4_16p8_5mm.blend \
     --start-frame 1 \
     --end-frame 191 \
     --step 1 \
     --outdir animation
-
-  python3 bsmv_make_animation.py \
-    --blend FM_15cm_Burner_C2H4_16p8_5mm.blend \
-    --start-frame 1 \
-    --end-frame 191 \
-    --step 1 \
-    --outdir animation \
-    --jobs 8
 """
 
 from __future__ import annotations
@@ -46,9 +33,6 @@ import platform
 import signal
 import subprocess
 import sys
-import threading
-import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 
@@ -57,7 +41,6 @@ from pathlib import Path
 # -----------------------------------------------------------------------------
 
 def argv_after_double_dash() -> list[str]:
-    """Return args after Blender's '--' separator, or normal script args."""
     if "--" in sys.argv:
         return sys.argv[sys.argv.index("--") + 1 :]
     return sys.argv[1:]
@@ -107,146 +90,55 @@ def png_path(outdir: Path, prefix: str, frame: int) -> Path:
 # Outer mode: launched by system Python
 # -----------------------------------------------------------------------------
 
-_ACTIVE_PROCS: set[subprocess.Popen] = set()
-_ACTIVE_META: dict[subprocess.Popen, dict] = {}
-_ACTIVE_LOCK = threading.Lock()
-_STOP_REQUESTED = False
-_STATUS_STOP = threading.Event()
+_ACTIVE_PROC: subprocess.Popen | None = None
 
 
-def _register_proc(proc: subprocess.Popen, frame: int | None = None, log_path: Path | None = None) -> None:
-    with _ACTIVE_LOCK:
-        _ACTIVE_PROCS.add(proc)
-        _ACTIVE_META[proc] = {
-            "frame": frame,
-            "log_path": log_path,
-            "start_time": time.time(),
-        }
+def terminate_active_child(reason: str = "shutdown") -> None:
+    global _ACTIVE_PROC
 
+    proc = _ACTIVE_PROC
+    if proc is None or proc.poll() is not None:
+        return
 
-def _unregister_proc(proc: subprocess.Popen) -> None:
-    with _ACTIVE_LOCK:
-        _ACTIVE_PROCS.discard(proc)
-        _ACTIVE_META.pop(proc, None)
+    print(f"\n[anim] terminating active Blender process due to {reason}...", flush=True)
 
-
-def _format_elapsed(seconds: float) -> str:
-    seconds = int(max(0, seconds))
-    mm, ss = divmod(seconds, 60)
-    hh, mm = divmod(mm, 60)
-    if hh:
-        return f"{hh:d}:{mm:02d}:{ss:02d}"
-    return f"{mm:02d}:{ss:02d}"
-
-
-def _tail_last_interesting_line(path: Path | None) -> str:
-    if path is None or not path.exists():
-        return ""
     try:
-        # Only read the last chunk. Blender logs can get large.
-        with open(path, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 8192), 0)
-            chunk = f.read().decode("utf-8", errors="replace")
-        lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
-        for ln in reversed(lines):
-            low = ln.lower()
-            if (
-                "sample" in low
-                or "rendering" in low
-                or "time:" in low
-                or "remaining" in low
-                or ln.startswith("[render]")
-            ):
-                return ln[-120:]
-        return lines[-1][-120:] if lines else ""
+        if os.name == "posix":
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            proc.terminate()
     except Exception:
-        return ""
+        pass
 
-
-def status_heartbeat(total_frames: int, get_completed, heartbeat_sec: float = 10.0) -> None:
-    """Print periodic status so a long render does not look hung."""
-    heartbeat_sec = max(1.0, float(heartbeat_sec))
-    while not _STATUS_STOP.wait(heartbeat_sec):
-        with _ACTIVE_LOCK:
-            items = list(_ACTIVE_META.items())
-
-        if not items:
-            continue
-
-        active_bits = []
-        now = time.time()
-        for proc, meta in sorted(items, key=lambda x: (x[1].get("frame") or 0)):
-            frame = meta.get("frame")
-            elapsed = _format_elapsed(now - float(meta.get("start_time", now)))
-            pid = proc.pid
-            tail = _tail_last_interesting_line(meta.get("log_path"))
-            bit = f"f{int(frame):04d} pid={pid} elapsed={elapsed}"
-            if tail:
-                bit += f" | {tail}"
-            active_bits.append(bit)
-
-        print(
-            f"[status] done {get_completed()}/{total_frames}; active {len(active_bits)}: "
-            + " || ".join(active_bits),
-            flush=True,
-        )
-
-
-def terminate_all_children(reason: str = "signal") -> None:
-    """Terminate all active Blender subprocesses."""
-    with _ACTIVE_LOCK:
-        procs = list(_ACTIVE_PROCS)
-
-    if procs:
-        print(f"[anim] terminating {len(procs)} active Blender subprocess(es) due to {reason}...")
-
-    for proc in procs:
+    try:
+        proc.wait(timeout=5)
+    except Exception:
         try:
-            if proc.poll() is not None:
-                continue
-
-            if os.name == "posix":
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            else:
-                proc.terminate()
+            if proc.poll() is None:
+                if os.name == "posix":
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    proc.kill()
         except Exception:
             pass
 
-    # Give them a moment, then hard-kill stragglers.
-    for proc in procs:
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            try:
-                if proc.poll() is None:
-                    if os.name == "posix":
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    else:
-                        proc.kill()
-            except Exception:
-                pass
 
-
-def _signal_handler(signum, frame) -> None:
-    global _STOP_REQUESTED
-    _STOP_REQUESTED = True
+def signal_handler(signum, frame) -> None:
     signame = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
-    print(f"\n[anim] caught {signame}; stopping...")
-    terminate_all_children(reason=signame)
+    print(f"\n[anim] caught {signame}; stopping...", flush=True)
+    terminate_active_child(reason=signame)
     raise KeyboardInterrupt
 
 
 def parse_outer_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Render a Blender animation one fresh Blender process per frame.",
+        description="Render a Blender animation serially, one fresh Blender process per frame.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -258,35 +150,17 @@ def parse_outer_args() -> argparse.Namespace:
     p.add_argument("--outdir", default="animation", help="Output PNG directory")
     p.add_argument("--prefix", default=None, help="Output filename prefix; default is blend filename stem")
 
-    p.add_argument(
-        "--blender-bin",
-        default=str(default_blender_bin()),
-        help="Path to Blender executable",
-    )
-    p.add_argument(
-        "--loader",
-        default=None,
-        help="Optional explicit path to load_vdb_sparse_to_blender.py",
-    )
-
-    p.add_argument(
-        "--jobs", "-j", type=positive_int, default=1,
-        help="Maximum number of Blender frame renders to run in parallel",
-    )
+    p.add_argument("--blender-bin", default=str(default_blender_bin()), help="Path to Blender executable")
+    p.add_argument("--loader", default=None, help="Optional explicit path to load_vdb_sparse_to_blender.py")
 
     skip = p.add_mutually_exclusive_group()
-    skip.add_argument("--skip-existing", action="store_true", default=False,
-                      help="Skip frames whose PNG already exists")
-    skip.add_argument("--overwrite-existing", dest="skip_existing", action="store_false",
-                      help="Overwrite existing PNGs (default)")
-    # Ensure explicit default is overwrite.
+    skip.add_argument("--skip-existing", action="store_true", default=False, help="Skip frames whose PNG already exists")
+    skip.add_argument("--overwrite-existing", dest="skip_existing", action="store_false", help="Overwrite existing PNGs")
     p.set_defaults(skip_existing=False)
 
     p.add_argument("--samples", type=int, default=None, help="Override Cycles samples")
     p.add_argument("--render-engine", default=None, help="Override render engine, e.g. CYCLES")
-    p.add_argument("--verbose", action="store_true", help="Verbose per-frame Blender driver output")
-    p.add_argument("--heartbeat-sec", type=float, default=10.0,
-                   help="Seconds between parent status updates while frames are rendering")
+    p.add_argument("--verbose", action="store_true", help="Verbose one-frame render logging")
     p.add_argument("--dry-run", action="store_true", help="Print Blender commands without running them")
 
     return p.parse_args(argv_after_double_dash())
@@ -332,56 +206,23 @@ def build_blender_cmd(
     return cmd
 
 
-def render_one_frame_subprocess(
-    blender_bin: Path,
-    this_script: Path,
-    blend: Path,
-    frame: int,
-    outdir: Path,
-    prefix: str,
-    loader: str | None,
-    render_engine: str | None,
-    samples: int | None,
-    verbose: bool,
-) -> tuple[int, int]:
-    if _STOP_REQUESTED:
-        return frame, 130
+def run_blender_frame(cmd: list[str]) -> int:
+    global _ACTIVE_PROC
 
-    cmd = build_blender_cmd(
-        blender_bin=blender_bin,
-        this_script=this_script,
-        blend=blend,
-        frame=frame,
-        outdir=outdir,
-        prefix=prefix,
-        loader=loader,
-        render_engine=render_engine,
-        samples=samples,
-        verbose=verbose,
+    _ACTIVE_PROC = subprocess.Popen(
+        cmd,
+        start_new_session=(os.name == "posix"),
     )
-
-    if verbose:
-        print("[anim] cmd:", " ".join(cmd))
-
-    # start_new_session=True puts each Blender child in its own process group.
-    # That lets a single Ctrl-C in the parent kill all active children cleanly.
-    proc = subprocess.Popen(cmd, start_new_session=(os.name == "posix"))
-    _register_proc(proc, frame=frame, log_path=log_path)
     try:
-        rc = proc.wait()
+        return _ACTIVE_PROC.wait()
     finally:
-        _unregister_proc(proc)
-
-    return frame, rc
+        _ACTIVE_PROC = None
 
 
 def run_outer() -> int:
-    global _STOP_REQUESTED
-
-    # Install signal handlers for clean Ctrl-C termination.
-    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
     try:
-        signal.signal(signal.SIGTERM, _signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
     except Exception:
         pass
 
@@ -394,8 +235,6 @@ def run_outer() -> int:
     require_file(blend, "blend file")
     require_file(this_script, "this script")
 
-    # macOS app executable is absolute. For Linux "blender" on PATH may not exist
-    # as a file; in that case let subprocess find it.
     if str(blender_bin) != "blender":
         require_file(blender_bin, "Blender executable")
 
@@ -410,32 +249,29 @@ def run_outer() -> int:
     prefix = args.prefix if args.prefix else blend.stem
     frames = list(range(args.start_frame, args.end_frame + 1, args.step))
 
-    if args.skip_existing:
-        filtered = []
-        skipped_initial = 0
-        for frame in frames:
+    print(f"[anim] Blender:       {blender_bin}", flush=True)
+    print(f"[anim] Blend:         {blend}", flush=True)
+    print(f"[anim] Driver:        {this_script}", flush=True)
+    print(f"[anim] Loader:        {args.loader if args.loader else 'auto'}", flush=True)
+    print(f"[anim] Outdir:        {outdir}", flush=True)
+    print(f"[anim] Frames:        {args.start_frame} .. {args.end_frame} step {args.step}", flush=True)
+    print(f"[anim] Prefix:        {prefix}", flush=True)
+    print(f"[anim] Skip existing: {args.skip_existing}", flush=True)
+    print(f"[anim] Mode:          serial, one fresh Blender process per frame", flush=True)
+
+    completed = 0
+    skipped = 0
+    total = len(frames)
+
+    try:
+        for index, frame in enumerate(frames, start=1):
             png = png_path(outdir, prefix, frame)
-            if png.exists():
-                print(f"[anim] skip existing frame {frame}: {png}")
-                skipped_initial += 1
-            else:
-                filtered.append(frame)
-        frames = filtered
-    else:
-        skipped_initial = 0
 
-    print(f"[anim] Blender:       {blender_bin}")
-    print(f"[anim] Blend:         {blend}")
-    print(f"[anim] Driver:        {this_script}")
-    print(f"[anim] Loader:        {args.loader if args.loader else 'auto'}")
-    print(f"[anim] Outdir:        {outdir}")
-    print(f"[anim] Frames:        {args.start_frame} .. {args.end_frame} step {args.step}")
-    print(f"[anim] Prefix:        {prefix}")
-    print(f"[anim] Skip existing: {args.skip_existing}")
-    print(f"[anim] Jobs:          {args.jobs}")
+            if args.skip_existing and png.exists():
+                print(f"[anim] skip existing frame {frame}: {png}", flush=True)
+                skipped += 1
+                continue
 
-    if args.dry_run:
-        for frame in frames:
             cmd = build_blender_cmd(
                 blender_bin=blender_bin,
                 this_script=this_script,
@@ -448,124 +284,32 @@ def run_outer() -> int:
                 samples=args.samples,
                 verbose=args.verbose,
             )
-            print("[anim] dry run:", " ".join(cmd))
-        return 0
 
-    completed = 0
-    completed_lock = threading.Lock()
+            print(f"[anim] rendering frame {frame} ({index}/{total})", flush=True)
 
-    def get_completed() -> int:
-        with completed_lock:
-            return completed
+            if args.dry_run:
+                print("[anim] dry run:", " ".join(cmd), flush=True)
+                completed += 1
+                continue
 
-    _STATUS_STOP.clear()
-    status_thread = None
-    if not args.dry_run:
-        status_thread = threading.Thread(
-            target=status_heartbeat,
-            args=(len(frames), get_completed, args.heartbeat_sec),
-            daemon=True,
-        )
-        status_thread.start()
+            rc = run_blender_frame(cmd)
 
-    try:
-        if args.jobs == 1:
-            for frame in frames:
-                if _STOP_REQUESTED:
-                    break
-                print(f"[anim] rendering frame {frame}")
-                _, rc = render_one_frame_subprocess(
-                    blender_bin=blender_bin,
-                    this_script=this_script,
-                    blend=blend,
-                    frame=frame,
-                    outdir=outdir,
-                    prefix=prefix,
-                    loader=args.loader,
-                    render_engine=args.render_engine,
-                    samples=args.samples,
-                    verbose=args.verbose,
-                )
-                if rc != 0:
-                    print(f"[anim] ERROR: Blender failed on frame {frame} with return code {rc}", file=sys.stderr)
-                    print("[anim] Completed PNGs remain on disk.", file=sys.stderr)
-                    return rc
-                with completed_lock:
-                    completed += 1
-        else:
-            # Parallel scheduler with bounded concurrency.
-            jobs = min(args.jobs, len(frames)) if frames else 0
-            with ThreadPoolExecutor(max_workers=jobs) as pool:
-                pending = {}
-                frame_iter = iter(frames)
+            if rc != 0:
+                print(f"[anim] ERROR: Blender failed on frame {frame} with return code {rc}", file=sys.stderr, flush=True)
+                print("[anim] Completed PNGs remain on disk. Re-run with --skip-existing to resume.", file=sys.stderr, flush=True)
+                return rc
 
-                # Prime the queue.
-                for _ in range(jobs):
-                    try:
-                        frame = next(frame_iter)
-                    except StopIteration:
-                        break
-                    print(f"[anim] queue frame {frame}")
-                    fut = pool.submit(
-                        render_one_frame_subprocess,
-                        blender_bin, this_script, blend, frame, outdir, prefix,
-                        args.loader, args.render_engine, args.samples, args.verbose,
-                    )
-                    pending[fut] = frame
-
-                while pending:
-                    done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
-
-                    for fut in done:
-                        frame = pending.pop(fut)
-                        try:
-                            finished_frame, rc = fut.result()
-                        except KeyboardInterrupt:
-                            raise
-                        except Exception as e:
-                            print(f"[anim] ERROR: worker exception on frame {frame}: {e}", file=sys.stderr)
-                            terminate_all_children(reason="worker exception")
-                            return 1
-
-                        if rc != 0:
-                            print(
-                                f"[anim] ERROR: Blender failed on frame {finished_frame} "
-                                f"with return code {rc}",
-                                file=sys.stderr,
-                            )
-                            terminate_all_children(reason=f"frame {finished_frame} failure")
-                            return rc
-
-                        print(f"[anim] finished frame {finished_frame}")
-                        with completed_lock:
-                            completed += 1
-
-                        if not _STOP_REQUESTED:
-                            try:
-                                next_frame = next(frame_iter)
-                            except StopIteration:
-                                next_frame = None
-
-                            if next_frame is not None:
-                                print(f"[anim] queue frame {next_frame}")
-                                fut2 = pool.submit(
-                                    render_one_frame_subprocess,
-                                    blender_bin, this_script, blend, next_frame, outdir, prefix,
-                                    args.loader, args.render_engine, args.samples, args.verbose,
-                                )
-                                pending[fut2] = next_frame
+            completed += 1
+            print(f"[anim] finished frame {frame} ({completed} rendered, {skipped} skipped)", flush=True)
 
     except KeyboardInterrupt:
-        terminate_all_children(reason="Ctrl-C")
-        print("[anim] interrupted by user")
+        terminate_active_child(reason="Ctrl-C")
+        print("[anim] interrupted by user", flush=True)
         return 130
     finally:
-        _STATUS_STOP.set()
-        if status_thread is not None:
-            status_thread.join(timeout=2.0)
-        terminate_all_children(reason="shutdown")
+        terminate_active_child(reason="shutdown")
 
-    print(f"[anim] complete: rendered={get_completed()}, skipped={skipped_initial}, outdir={outdir}")
+    print(f"[anim] complete: rendered={completed}, skipped={skipped}, outdir={outdir}", flush=True)
     return 0
 
 
@@ -574,10 +318,7 @@ def run_outer() -> int:
 # -----------------------------------------------------------------------------
 
 def parse_inner_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Internal one-frame Blender render mode.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    p = argparse.ArgumentParser(description="Internal one-frame Blender render mode.")
 
     p.add_argument("--bsmv-single-frame", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--frame", type=int, required=True, help="Frame number to render")
@@ -599,14 +340,11 @@ def blender_find_loader(explicit: str | None) -> Path:
     if explicit:
         candidates.append(Path(explicit).expanduser())
 
-    # Same folder as this animation script.
     candidates.append(Path(__file__).resolve().parent / "load_vdb_sparse_to_blender.py")
 
-    # Same folder as the opened blend.
     if bpy.data.filepath:
         candidates.append(Path(bpy.data.filepath).resolve().parent / "load_vdb_sparse_to_blender.py")
 
-    # Current working directory.
     candidates.append(Path.cwd() / "load_vdb_sparse_to_blender.py")
 
     for c in candidates:
@@ -624,22 +362,20 @@ def blender_find_loader(explicit: str | None) -> Path:
 def free_blender_render_memory(verbose: bool = False) -> None:
     import bpy
 
-    # Mostly belt-and-suspenders because this process exits after the frame,
-    # but it helps with driver-level cleanup before shutdown.
     for name in ("Render Result", "Viewer Node", "Composite"):
         img = bpy.data.images.get(name)
         if img is not None:
             try:
                 img.buffers_free()
                 if verbose:
-                    print(f"[mem] freed image buffers for {name}")
+                    print(f"[mem] freed image buffers for {name}", flush=True)
             except Exception:
                 pass
 
     try:
         bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
         if verbose:
-            print("[mem] ran orphans_purge")
+            print("[mem] ran orphans_purge", flush=True)
     except Exception:
         pass
 
@@ -654,11 +390,9 @@ def run_inner_blender() -> int:
     loader = blender_find_loader(args.loader)
 
     if args.verbose:
-        print(f"[render] opened blend: {bpy.data.filepath}")
-        print(f"[render] using loader: {loader}")
+        print(f"[render] opened blend: {bpy.data.filepath}", flush=True)
+        print(f"[render] using loader: {loader}", flush=True)
 
-    # Load/refresh the bsmv scene in this fresh Blender process. The loader also
-    # registers the VDB frame-change handler.
     runpy.run_path(str(loader), run_name="__main__")
 
     scene = bpy.context.scene
@@ -687,7 +421,6 @@ def run_inner_blender() -> int:
     if not prefix:
         prefix = Path(bpy.data.filepath).stem if bpy.data.filepath else "frame"
 
-    # Setting the frame after the loader run triggers the bsmv frame handler.
     scene.frame_set(args.frame)
     view_layer.update()
 
@@ -697,10 +430,10 @@ def run_inner_blender() -> int:
     scene.render.use_overwrite = True
     scene.render.filepath = str(outdir / f"{prefix}_{args.frame:04d}")
 
-    print(f"[render] frame={args.frame} -> {scene.render.filepath}.png")
+    print(f"[render] frame={args.frame} -> {scene.render.filepath}.png", flush=True)
     bpy.ops.render.render(write_still=True)
     free_blender_render_memory(verbose=args.verbose)
-    print(f"[render] done frame={args.frame}")
+    print(f"[render] done frame={args.frame}", flush=True)
     return 0
 
 
