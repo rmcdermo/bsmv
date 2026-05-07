@@ -51,7 +51,7 @@ CYCLES_VOLUME_PREVIEW_STEP_RATE = 0.001
 # Volume material transfer-function settings.
 # For Material Preview / quick scene checks, keep smoke off so the gray density
 # cloud does not hide the flame. Turn USE_SMOKE back on later for smoke renders.
-USE_SMOKE = True
+USE_SMOKE = False
 SMOKE_DENSITY_SCALE = 100.0
 SMOKE_COLOR = (0.035, 0.035, 0.035, 1.0)
 
