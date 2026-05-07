@@ -13,6 +13,10 @@ BLENDER_VDB_DIR  = "/Users/rmcdermo/spark_home/rmcdermo/GitHub/firemodels/fds/Va
 # This loader is intended to give a clean, complete scene every run.
 CLEAN_SCENE = True
 
+# Preserve the current active render camera, including its collection membership.
+PRESERVE_ACTIVE_CAMERA = True
+PRESERVE_BSMV_CAMERA = False
+
 LOAD_GEOMETRY  = True
 LOAD_SCENE_BOX = True
 LOAD_VDB       = True
@@ -37,6 +41,8 @@ APPLY_MANIFEST_SPACING = True
 SET_RENDERED_VIEW = False
 SET_CYCLES = True
 SCENE_FPS = 10
+CYCLES_VIEWPORT_SAMPLES = 16
+CYCLES_RENDER_SAMPLES = 128
 
 # Cycles volume stepping. Smaller values reveal finer detail but render slower.
 CYCLES_VOLUME_STEP_RATE = 0.001
@@ -60,7 +66,7 @@ SUN_ENERGY = 3.0
 WORLD_COLOR = (0.8, 0.8, 0.8)
 
 # Camera knobs
-ADD_BASIC_CAMERA = True
+ADD_BASIC_CAMERA = False
 CAMERA_LENS_MM = 35.0
 CAMERA_DISTANCE_MULTIPLIER = 1.75
 CAMERA_DIRECTION = (-1.25, -2.40, 1.15)
@@ -78,6 +84,11 @@ PRINT_GRID_LOADS = False
 
 # Scene helper drawing; these are now handled by load_vdb_sparse_to_blender.py.
 DRAW_DOMAIN_BOX = True
+
+DRAW_DOMAIN_WALLS = True
+DOMAIN_WALL_COLOR = (0.80, 0.88, 0.96, 0.10)
+DOMAIN_FLOOR_COLOR = (0.05, 0.10, 1.00, 0.80)
+DOMAIN_WALL_EXCLUDE = ()
 DRAW_MESH_BOXES = False
 DRAW_VENTS = True
 DOMAIN_BOX_COLOR = (0.0, 0.0, 0.0, 1.0)

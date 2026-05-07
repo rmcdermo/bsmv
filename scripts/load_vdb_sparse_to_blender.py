@@ -1,10 +1,12 @@
 # load_vdb_sparse_to_blender.py
 #
+# Drop-in Blender loader for bsmv output.
+#
 # This script is intentionally self-contained. Put it next to:
 #   bsmv_blender_config.py
 #
 # If CLEAN_SCENE=True, every run removes old bsmv-managed objects/collections
-# before loading new GEOM, scene/domain box, VDB volumes, sun, and camera.
+# before loading new GEOM, scene/domain walls, VDB volumes, and sun.
 #
 # Managed collections:
 #   bsmv_geometry
@@ -167,6 +169,7 @@ def read_json(path: Path) -> dict[str, Any]:
 MANAGED_COLLECTION_NAMES = (
     "bsmv_geometry",
     "bsmv_scene",
+    "bsmv_domain_walls",
     "bsmv_vents",
     "bsmv_vdb_volumes",
     "FDS_VDB_VOLUMES",
@@ -174,6 +177,7 @@ MANAGED_COLLECTION_NAMES = (
 
 MANAGED_OBJECT_PREFIXES_BASE = (
     "bsmv_domain_bbox",
+    "bsmv_domain_wall",
     "bsmv_mesh_bbox",
     "bsmv_vent",
     "bsmv_sun",
@@ -187,11 +191,159 @@ MANAGED_OBJECT_PREFIXES_BASE = (
 def remove_old_handlers() -> None:
     for handler_list in (bpy.app.handlers.frame_change_pre, bpy.app.handlers.frame_change_post):
         for h in list(handler_list):
-            if getattr(h, "__name__", "") == "bsmv_sparse_frame_handler":
+            name = getattr(h, "__name__", "")
+            wrapped = getattr(h, "__wrapped__", None)
+            wrapped_name = getattr(wrapped, "__name__", "")
+            if name == "bsmv_sparse_frame_handler" or wrapped_name == "bsmv_sparse_frame_handler":
                 handler_list.remove(h)
 
 
+def _preserved_camera_temp_collection_name() -> str:
+    return "__bsmv_preserved_camera_tmp__"
+
+
+def is_preserved_camera(obj: bpy.types.Object | None) -> bool:
+    if obj is None:
+        return False
+    try:
+        return bool(obj.get("bsmv_preserved_camera", False))
+    except Exception:
+        return False
+
+
+def _collection_names_for_object(obj: bpy.types.Object) -> list[str]:
+    names: list[str] = []
+    try:
+        for coll in obj.users_collection:
+            if coll.name != _preserved_camera_temp_collection_name():
+                names.append(coll.name)
+    except Exception:
+        pass
+    return names
+
+
+def _link_collection_to_scene_root(coll: bpy.types.Collection) -> None:
+    root = bpy.context.scene.collection
+    try:
+        if coll.name not in [c.name for c in root.children]:
+            root.children.link(coll)
+    except Exception:
+        pass
+
+
+def _get_or_create_collection_raw(name: str) -> bpy.types.Collection:
+    coll = bpy.data.collections.get(name)
+    if coll is None:
+        coll = bpy.data.collections.new(name)
+    _link_collection_to_scene_root(coll)
+    return coll
+
+
+def _link_object_to_collection(obj: bpy.types.Object, coll: bpy.types.Collection) -> None:
+    try:
+        if obj.name not in coll.objects:
+            coll.objects.link(obj)
+    except Exception:
+        pass
+
+
+def stash_active_camera_if_requested() -> bpy.types.Object | None:
+    """Protect the active render camera while preserving its collection membership.
+
+    This does not rename the camera and does not move it out of the user's
+    chosen collection permanently.  It only adds a temporary hidden keep-alive
+    collection before cleanup, then restore_preserved_camera() removes that
+    temporary link after bsmv_scene/bsmv_geometry/etc. are recreated.
+    """
+    if not bool(C("PRESERVE_ACTIVE_CAMERA", True)):
+        return None
+
+    cam = bpy.context.scene.camera
+    if cam is None:
+        return None
+
+    if cam.name.startswith("bsmv_camera") and not bool(C("PRESERVE_BSMV_CAMERA", False)):
+        return None
+
+    original_collections = _collection_names_for_object(cam)
+
+    try:
+        cam["bsmv_loader_managed"] = False
+        cam["bsmv_preserved_camera"] = True
+        cam["bsmv_preserved_camera_collections"] = json.dumps(original_collections)
+    except Exception:
+        pass
+
+    temp_coll = _get_or_create_collection_raw(_preserved_camera_temp_collection_name())
+    try:
+        temp_coll.hide_viewport = True
+        temp_coll.hide_render = True
+    except Exception:
+        pass
+
+    _link_object_to_collection(cam, temp_coll)
+    bpy.context.scene.camera = cam
+
+    print(f"[camera] preserving active camera: {cam.name} collections={original_collections}")
+    return cam
+
+
+def restore_preserved_camera(cam: bpy.types.Object | None) -> None:
+    if cam is None:
+        return
+
+    try:
+        cam_name = cam.name
+    except ReferenceError:
+        print("[camera] ERROR: preserved camera object was removed")
+        return
+
+    try:
+        original_collections = json.loads(cam.get("bsmv_preserved_camera_collections", "[]"))
+    except Exception:
+        original_collections = []
+
+    if not original_collections:
+        _link_object_to_collection(cam, bpy.context.scene.collection)
+    else:
+        for coll_name in original_collections:
+            if coll_name == _preserved_camera_temp_collection_name():
+                continue
+            coll = _get_or_create_collection_raw(str(coll_name))
+            _link_object_to_collection(cam, coll)
+
+    temp_coll = bpy.data.collections.get(_preserved_camera_temp_collection_name())
+    if temp_coll is not None:
+        try:
+            if cam.name in temp_coll.objects:
+                temp_coll.objects.unlink(cam)
+        except Exception:
+            pass
+        try:
+            if len(temp_coll.objects) == 0 and len(temp_coll.children) == 0:
+                bpy.data.collections.remove(temp_coll)
+        except Exception:
+            pass
+
+    try:
+        cam.hide_viewport = False
+        cam.hide_render = False
+        cam["bsmv_loader_managed"] = False
+        cam["bsmv_preserved_camera"] = True
+    except Exception:
+        pass
+
+    bpy.context.scene.camera = cam
+    print(f"[camera] restored active camera: {cam_name} collections={original_collections}")
+
+
+
+
 def delete_object(obj: bpy.types.Object) -> None:
+    if is_preserved_camera(obj):
+        print(f"[clean] keeping preserved camera: {obj.name}")
+        return
+
     try:
         bpy.data.objects.remove(obj, do_unlink=True)
     except Exception:
@@ -298,18 +450,6 @@ def clean_bsmv_scene() -> None:
 
     purge_orphans()
 
-
-def full_scene_clear() -> None:
-    bpy.ops.object.select_all(action="SELECT")
-    bpy.ops.object.delete()
-
-    for coll in list(bpy.data.collections):
-        try:
-            bpy.data.collections.remove(coll)
-        except Exception:
-            pass
-
-    purge_orphans()
 
 
 def get_or_create_collection(name: str) -> bpy.types.Collection:
@@ -502,6 +642,10 @@ def bbox_from_loaded_objects() -> list[float] | None:
 
 
 def add_basic_camera() -> None:
+    if bool(C("PRESERVE_ACTIVE_CAMERA", True)) and bpy.context.scene.camera is not None:
+        print("[camera] add_basic_camera skipped because active camera is preserved")
+        return
+
     if not C("ADD_BASIC_CAMERA", True):
         return
 
@@ -647,6 +791,67 @@ def vent_material(rgb, alpha, suffix: str) -> bpy.types.Material:
     return make_material(f"bsmv_vent_{suffix}", (float(r), float(g), float(b), a))
 
 
+def domain_wall_material() -> bpy.types.Material:
+    return make_material("bsmv_domain_wall", C("DOMAIN_WALL_COLOR", (0.80, 0.88, 0.96, 0.10)))
+
+
+def domain_floor_material() -> bpy.types.Material:
+    return make_material("bsmv_domain_floor", C("DOMAIN_FLOOR_COLOR", (0.05, 0.10, 1.00, 0.80)))
+
+
+def quad_for_domain_face(bbox, face: str):
+    xmin, xmax, ymin, ymax, zmin, zmax = [float(v) for v in bbox]
+    face = str(face).lower()
+    if face == "xmin":
+        return [(xmin, ymin, zmin), (xmin, ymax, zmin), (xmin, ymax, zmax), (xmin, ymin, zmax)]
+    if face == "xmax":
+        return [(xmax, ymin, zmin), (xmax, ymax, zmin), (xmax, ymax, zmax), (xmax, ymin, zmax)]
+    if face == "ymin":
+        return [(xmin, ymin, zmin), (xmax, ymin, zmin), (xmax, ymin, zmax), (xmin, ymin, zmax)]
+    if face == "ymax":
+        return [(xmin, ymax, zmin), (xmax, ymax, zmin), (xmax, ymax, zmax), (xmin, ymax, zmax)]
+    if face == "zmin":
+        return [(xmin, ymin, zmin), (xmax, ymin, zmin), (xmax, ymax, zmin), (xmin, ymax, zmin)]
+    if face == "zmax":
+        return [(xmin, ymin, zmax), (xmax, ymin, zmax), (xmax, ymax, zmax), (xmin, ymax, zmax)]
+    raise ValueError(f"Unknown domain face {face}")
+
+
+def make_quad(name: str, verts, mat: bpy.types.Material, collection: bpy.types.Collection) -> bpy.types.Object:
+    mesh = bpy.data.meshes.new(name + "_mesh")
+    mesh.from_pydata(list(verts), [], [(0, 1, 2, 3)])
+    mesh.update()
+
+    obj = bpy.data.objects.new(name, mesh)
+    obj["bsmv_loader_managed"] = True
+    if mat is not None:
+        mesh.materials.append(mat)
+    collection.objects.link(obj)
+
+    try:
+        user_coll = bpy.context.scene.collection
+        if user_coll and obj.name in user_coll.objects:
+            user_coll.objects.unlink(obj)
+    except Exception:
+        pass
+
+    return obj
+
+
+def make_domain_walls(prefix: str, bbox, collection: bpy.types.Collection) -> list[bpy.types.Object]:
+    excluded = {str(v).lower() for v in C("DOMAIN_WALL_EXCLUDE", ())}
+    faces = ["xmin", "xmax", "ymin", "ymax", "zmin", "zmax"]
+    wall_mat = domain_wall_material()
+    floor_mat = domain_floor_material()
+    loaded: list[bpy.types.Object] = []
+    for face in faces:
+        if face in excluded:
+            continue
+        mat = floor_mat if face == "zmin" else wall_mat
+        loaded.append(make_quad(f"{prefix}_{face}", quad_for_domain_face(bbox, face), mat, collection))
+    return loaded
+
+
 def bbox_vertices_and_edges(bbox):
     xmin, xmax, ymin, ymax, zmin, zmax = [float(v) for v in bbox]
     verts = [
@@ -770,11 +975,16 @@ def load_scene_box() -> list[bpy.types.Object]:
     scene_coll = get_or_create_collection("bsmv_scene")
 
     draw_domain = config_bool("DRAW_DOMAIN_BOX", "BLENDER_DRAW_DOMAIN_BOX", True)
+    draw_domain_walls = config_bool("DRAW_DOMAIN_WALLS", "BLENDER_DRAW_DOMAIN_WALLS", False)
     draw_mesh_boxes = config_bool("DRAW_MESH_BOXES", "BLENDER_DRAW_MESH_BOXES", False)
     draw_vents = config_bool("DRAW_VENTS", "BLENDER_DRAW_VENTS", True)
 
     if draw_domain and scene.get("domain_bbox"):
         loaded.append(make_wire_box("bsmv_domain_bbox", scene["domain_bbox"], domain_material(), scene_coll))
+
+    if draw_domain_walls and scene.get("domain_bbox"):
+        wall_coll = get_or_create_collection("bsmv_domain_walls")
+        loaded.extend(make_domain_walls("bsmv_domain_wall", scene["domain_bbox"], wall_coll))
 
     if draw_mesh_boxes:
         mat = mesh_box_material()
@@ -1228,7 +1438,12 @@ def load_vdbs() -> list[bpy.types.Object]:
         if every and i % every == 0:
             print(f"[vdb] loaded {i}/{len(items)}")
 
+    # Register the frame-update handler. This must be present for animation
+    # renders; otherwise Blender keeps rendering whatever VDB file was loaded
+    # last in the viewport.
+    remove_old_handlers()
     bpy.app.handlers.frame_change_post.append(bsmv_sparse_frame_handler)
+    print("[vdb] registered frame_change_post handler: bsmv_sparse_frame_handler")
 
     bpy.context.scene.frame_set(int(bpy.context.scene.frame_current))
     bpy.context.view_layer.update()
@@ -1242,15 +1457,13 @@ def load_vdbs() -> list[bpy.types.Object]:
 # -----------------------------------------------------------------------------
 
 def run() -> None:
-    clean_scene = bool(C("CLEAN_SCENE", C("CLEAR_SCENE", True)))
+    preserved_camera = stash_active_camera_if_requested()
 
+    clean_scene = bool(C("CLEAN_SCENE", C("CLEAR_SCENE", True)))
     if clean_scene:
         clean_bsmv_scene()
     else:
         remove_old_handlers()
-
-    if bool(C("NUKE_SCENE", False)):
-        full_scene_clear()
 
     set_render_settings()
     add_basic_lighting()
@@ -1264,7 +1477,12 @@ def run() -> None:
     if C("LOAD_VDB", True):
         load_vdbs()
 
-    add_basic_camera()
+    restore_preserved_camera(preserved_camera)
+
+    if not (bool(C("PRESERVE_ACTIVE_CAMERA", True)) and preserved_camera is not None):
+        add_basic_camera()
+
+    restore_preserved_camera(preserved_camera)
     set_rendered_view()
     print("[done] sparse loader clean load complete")
 
