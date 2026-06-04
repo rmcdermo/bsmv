@@ -26,7 +26,7 @@ cmake -S . -B build
 cmake --build build -j
 ```
 
-This project expects an [OpenVDB](git@github.com:AcademySoftwareFoundation/openvdb.git) installation discoverable by CMake.
+This project expects an OpenVDB installation discoverable by CMake.  Clone the repo `git@github.com:AcademySoftwareFoundation/openvdb.git` and follow the build instructions.
 
 ## Example
 
