@@ -21,18 +21,12 @@ The code is intentionally serial and simple. The hot loop is already compiled an
 
 ## Build
 
-### First build OpenVDB
-
-Clone `openvdb` from `git@github.com:AcademySoftwareFoundation/openvdb.git` and following build instructions.
-
-### Next build bsmv
-
 ```bash
 cmake -S . -B build
 cmake --build build -j
 ```
 
-This project expects an OpenVDB installation discoverable by CMake.
+This project expects an [OpenVDB](git@github.com:AcademySoftwareFoundation/openvdb.git) installation discoverable by CMake.
 
 ## Example
 
